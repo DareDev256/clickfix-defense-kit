@@ -1,0 +1,20 @@
+# CONFIRMED-SECRET-OK: decoy honeytoken file. Every value below is a FAKE
+# placeholder (contains PLACEHOLDER / EXAMPLE). Bait only — no live secrets.
+#
+# DECOY .env — DO NOT USE. Planted by the ClickFix Defense Kit canary generator.
+# Marker: @@MARKER@@
+# Created: @@CREATED@@
+#
+# These bait keys exist to detect infostealers (AMOS/Atomic/Poseidon) and
+# ClickFix-pasted payloads that scrape .env files. The canarytoken URL fires when
+# the bait is used. Swap @@CANARY_URL@@ for your own minted token from
+# canarytokens.org to receive the breach alert.
+DATABASE_URL=postgres://decoy_user:PLACEHOLDER_PASSWORD_EXAMPLE@db.example.invalid:5432/prod
+STRIPE_SECRET_KEY=sk_live_PLACEHOLDER_EXAMPLE_NOT_A_REAL_KEY
+STRIPE_PUBLISHABLE_KEY=pk_live_PLACEHOLDER_EXAMPLE
+JWT_SECRET=PLACEHOLDER_JWT_SECRET_EXAMPLE_DO_NOT_USE
+ADMIN_PASSWORD=PLACEHOLDER_ADMIN_PW_EXAMPLE
+# Web-bug canarytoken: any tool that fetches this URL trips the alert.
+CANARY_WEBHOOK=@@CANARY_URL@@
+AWS_ACCESS_KEY_ID=@@AWS_KEY@@
+AWS_SECRET_ACCESS_KEY=@@AWS_SECRET@@

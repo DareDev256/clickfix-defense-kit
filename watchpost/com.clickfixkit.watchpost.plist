@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  com.clickfixkit.watchpost.plist — ClickFix Defense Kit / WatchPost
+  ----------------------------------------------------------------------------
+  Runs watchpost.sh on a schedule as a per-USER LaunchAgent.
+
+  WHY A USER AGENT (not a root LaunchDaemon)?
+    This agent runs as you, in your login (Aqua) session, so:
+      - it can read ~/Library/LaunchAgents
+      - osascript notifications and login-item enumeration work (they need a
+        GUI session; a root LaunchDaemon has none)
+    A user agent CANNOT fully read /Library/LaunchDaemons (root-owned). If you
+    want full system-daemon coverage, ALSO install a root LaunchDaemon variant
+    that runs watchpost.sh with WATCHPOST_STATE_DIR pointed at a root-owned
+    state dir and no GUI notifications. See README.md "Root coverage".
+
+  CADENCE
+    StartInterval below runs every hour (3600s). Switch to StartCalendarInterval
+    if you prefer fixed wall-clock times. RunAtLoad fires once at login so a
+    freshly-booted Mac re-baselines / checks immediately.
+
+  PLACEHOLDERS — EDIT BEFORE LOADING
+    Replace __USERNAME__ with your short username (e.g. output of `whoami`).
+    install.sh does this substitution for you automatically.
+
+  TCC / FULL DISK ACCESS
+    To read ~/Library reliably and avoid mid-session EPERM, grant Full Disk
+    Access to /bin/bash (the ProgramArguments[0] interpreter) under
+    System Settings > Privacy & Security > Full Disk Access.
+  ----------------------------------------------------------------------------
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.clickfixkit.watchpost</string>
+
+    <!-- The command: run the monitor script. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/__USERNAME__/dev/clickfix-defense-kit/watchpost/watchpost.sh</string>
+    </array>
+
+    <!-- Run once at login, then every hour. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <!-- Keep the baseline state in the user's home. (Script default already
+         resolves $HOME; set explicitly so launchd's minimal env is unambiguous.) -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>WATCHPOST_STATE_DIR</key>
+        <string>/Users/__USERNAME__/.local/state/watchpost</string>
+        <key>HOME</key>
+        <string>/Users/__USERNAME__</string>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Capture stdout/stderr for debugging. Tail these if alerts seem missing. -->
+    <key>StandardOutPath</key>
+    <string>/Users/__USERNAME__/.local/state/watchpost/watchpost.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/__USERNAME__/.local/state/watchpost/watchpost.err.log</string>
+
+    <!-- Do not relaunch on exit; this is a periodic one-shot, not a daemon. -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- Be a good citizen: low priority, this is background hygiene. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>Nice</key>
+    <integer>5</integer>
+</dict>
+</plist>

@@ -1,0 +1,110 @@
+# ==============================================================================
+# .gitignore — ClickFix Defense Kit
+#
+# This is a defensive security project. The HIGHEST-RISK leak surface here is
+# real scan output, real decoys/tokens, and real secrets/PII from a developer's
+# own machine accidentally getting committed. These rules are intentionally
+# aggressive: when in doubt, exclude.
+# ==============================================================================
+
+# ---- Real secrets / credentials (never commit) -------------------------------
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.keystore
+id_rsa
+id_ed25519
+*.ppk
+.secrets
+.secrets/
+secrets.*
+*-credentials
+credentials
+.aws/
+.netrc
+.npmrc
+
+# ---- Live honeytokens / Canary output (ship MINTING code, never minted tokens)
+# Real canarytokens.org tokens and webhook configs are LIVE and beacon to the
+# owner's own infra — they must never be committed.
+canary-ledger.tsv
+*-canary-ledger.tsv
+canary-token.txt
+canary-webhook.*
+*.canary
+planted/
+decoys-live/
+
+# ---- ExposureScan / scan reports (real attack-surface maps) ------------------
+# Real run output is a map of YOUR exposure. The committed example is
+# exposurescan/sample-report.md (fake placeholder data) — keep ONLY that.
+*-report.md
+exposure*.md
+exposure*.json
+!exposurescan/sample-report.md
+*.scan.json
+.local/
+
+# ---- WatchPost / persistence baselines (host fingerprints) -------------------
+baseline.json
+persistence-baseline.json
+watchpost*.log
+*.out.log
+*.err.log
+state/
+
+# ---- Test/fixture data that could carry real values --------------------------
+# Synthetic DBs only — never commit a real Login Data / NoteStore copy.
+Login Data
+Login Data*
+NoteStore.sqlite*
+*.sqlite
+*.sqlite3
+*.db
+fixtures-real/
+
+# ---- Backups, snapshots, temp --------------------------------------------------
+*.bak
+*.orig
+*.tmp
+*.swp
+*~
+snapshots/
+*.snapshot
+/tmp/
+
+# ---- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# ---- Node (in case tooling is added later) -----------------------------------
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# ---- Editor / OS -------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.idea/
+.vscode/
+*.code-workspace
+.history/
+
+# ---- Rendered launchd plists with real usernames/paths -----------------------
+# Templates (committed) use __USERNAME__ / placeholder paths. A rendered copy
+# carries a real $HOME and should not be committed.
+*.installed.plist
+com.clickfixkit.*.rendered.plist

@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  com.clickfixkit.clipsentinel.plist
+
+  LaunchAgent that runs ClipSentinel at login and keeps it alive.
+
+  install.sh rewrites the __CLIPSENTINEL_DIR__ token below to the real install
+  path (the directory this plist lives in) before copying it into
+  ~/Library/LaunchAgents. If you place it by hand, replace __CLIPSENTINEL_DIR__
+  with the absolute path to the folder containing clipsentinel.sh, e.g.
+  /Users/youruser/dev/clickfix-defense-kit/clipsentinel
+
+  This is a LaunchAgent (per-user, runs in the GUI session) — correct, because
+  the clipboard and osascript notifications are per-user, GUI-session concepts.
+  Do NOT install this as a system-wide LaunchDaemon: daemons have no access to
+  the logged-in user's pasteboard or notification center.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.clickfixkit.clipsentinel</string>
+
+    <!-- Run the watcher script under zsh. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>__CLIPSENTINEL_DIR__/clipsentinel.sh</string>
+    </array>
+
+    <!-- Start at login... -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- ...and restart if it ever exits (the script is an infinite loop, so
+         this only matters if it crashes or is killed). Throttle restarts so a
+         crash-loop can't burn CPU. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Optional tuning via the environment. Uncomment/edit as desired:
+         CLIPSENTINEL_INTERVAL  poll seconds (default 1)
+         CLIPSENTINEL_DIALOG    "1" to also raise a modal dialog
+         CLIPSENTINEL_LOG       path to an append-only event log
+         CLIPSENTINEL_DISABLE   "1" kill switch -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CLIPSENTINEL_INTERVAL</key>
+        <string>1</string>
+        <key>CLIPSENTINEL_DIALOG</key>
+        <string>0</string>
+        <key>CLIPSENTINEL_LOG</key>
+        <string>__CLIPSENTINEL_DIR__/clipsentinel.log</string>
+    </dict>
+
+    <!-- launchd captures the script's stdout/stderr here for debugging. -->
+    <key>StandardOutPath</key>
+    <string>__CLIPSENTINEL_DIR__/clipsentinel.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__CLIPSENTINEL_DIR__/clipsentinel.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
