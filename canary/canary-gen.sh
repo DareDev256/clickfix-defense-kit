@@ -176,8 +176,8 @@ plant_set_for_dir() {
   local dir="$1"
   mkdir -p "$dir"
   case "$dir" in
-    *.aws|*/.aws) plant_aws_creds "$dir" ;;
-    *Desktop|*Documents|*/Desktop|*/Documents)
+    *.aws) plant_aws_creds "$dir" ;;
+    *Desktop|*Documents)
         plant_passwords "$dir"; plant_dotenv "$dir" ;;
     *)  plant_dotenv "$dir" ;;
   esac
@@ -195,7 +195,7 @@ do_list() {
     return 0
   fi
   # Pretty-print the ledger; flag any decoy that has since been deleted.
-  tail -n +2 "$LEDGER" | while IFS=$'\t' read -r marker path kind created; do
+  tail -n +2 "$LEDGER" | while IFS=$'\t' read -r marker path _kind _created; do
     if [ -e "$path" ]; then
       printf '  %s%-22s%s %-18s %s\n' "$GRN" "$marker" "$RST" "$kind" "$path"
     else
@@ -208,7 +208,7 @@ do_list() {
 do_revert() {
   ensure_state
   note "Removing all decoys this tool planted..."
-  tail -n +2 "$LEDGER" | while IFS=$'\t' read -r marker path kind created; do
+  tail -n +2 "$LEDGER" | while IFS=$'\t' read -r marker path _kind _created; do
     if [ -e "$path" ] && grep -q "$marker" "$path" 2>/dev/null; then
       rm -f "$path" && ok "Removed ${path}  [${marker}]"
     fi

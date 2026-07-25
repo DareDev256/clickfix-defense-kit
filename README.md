@@ -1,5 +1,7 @@
 # ClickFix Defense Kit
 
+[![CI](https://github.com/DareDev256/clickfix-defense-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/DareDev256/clickfix-defense-kit/actions/workflows/ci.yml) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) ![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey) [![Release](https://img.shields.io/github/v/release/DareDev256/clickfix-defense-kit)](https://github.com/DareDev256/clickfix-defense-kit/releases)
+
 **A small, honest, defensive toolkit for solo developers, freelancers, and families
 who use one Mac for everything — built after a single human moment cost me my
 whole digital life.**

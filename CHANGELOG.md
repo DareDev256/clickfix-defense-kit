@@ -5,6 +5,22 @@ All notable changes to the ClickFix Defense Kit are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- CI on every push and pull request: ShellCheck (warning severity) over the bash
+  scripts, a real `zsh -n` parse for the three zsh scripts ShellCheck cannot read,
+  and the ExposureScan redaction invariant suite.
+- CI, license, platform, and release badges in the README.
+
+### Fixed
+- `canary-gen.sh`: redundant `case` patterns that shadowed each other
+  (`*/.aws` was already covered by `*.aws`; same for Desktop and Documents).
+  No behaviour change.
+- `canary-gen.sh`: unused loop variables in the revert ledger read.
+- `shellguard/install.sh`: split `local backup=...$(date)` so a failing `date`
+  cannot be masked by `local`'s exit status.
+
 ## [0.1.0] - 2026-05-31
 
 Initial public release. Six independent, defensive tools plus a top-level

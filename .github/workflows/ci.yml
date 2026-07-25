@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    name: ShellCheck (bash)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint bash scripts
+        run: |
+          shellcheck -S warning \
+            install.sh \
+            canary/canary-gen.sh \
+            guestmode/setup-guestmode.sh \
+            shellguard/install.sh \
+            watchpost/install.sh \
+            watchpost/watchpost.sh
+
+  zsh-syntax:
+    name: zsh syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh
+      - name: Parse zsh scripts
+        # ShellCheck cannot parse zsh (SC1071), so these get a real zsh parse instead.
+        run: |
+          for f in clipsentinel/clipsentinel.sh clipsentinel/install.sh shellguard/shellguard.zsh; do
+            echo "-- $f"
+            zsh -n "$f"
+          done
+
+  exposurescan-tests:
+    name: ExposureScan redaction invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run redaction test suite
+        # The load-bearing invariant: no secret value ever reaches an output artifact.
+        working-directory: exposurescan
+        run: python3 -m unittest discover -s tests -v

@@ -73,7 +73,8 @@ is_installed() {
 remove_block() {
   [[ -f "$RC_FILE" ]] || return 0
   is_installed || return 0
-  local backup="${RC_FILE}.shellguard.bak.$(date +%Y%m%d%H%M%S)"
+  local backup
+  backup="${RC_FILE}.shellguard.bak.$(date +%Y%m%d%H%M%S)"
   cp -p "$RC_FILE" "$backup"
   awk -v b="$BEGIN_MARK" -v e="$END_MARK" '
     $0 == b { skip=1; next }
