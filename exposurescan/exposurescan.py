@@ -28,22 +28,32 @@ Secret VALUES never touch memory, never get printed, never get written to disk.
                          (right of '=') is measured for length/entropy to score
                          risk, then *immediately discarded* — never stored,
                          never printed.
-  * Apple Notes        : we report a note TITLE + matched CATEGORY only
-                         (e.g. "Note 'Bank stuff' -> seed-phrase pattern").
-                         The matched substring is never emitted.
+  * Apple Notes        : we report a note's PRIMARY KEY, title LENGTH,
+                         modification date and matched CATEGORY. The title
+                         itself is NEVER emitted — on macOS a Note has no
+                         user-chosen title; ZTITLE1 is derived from the note's
+                         FIRST LINE, so for the exact user this surface exists
+                         for (someone who pasted a seed phrase into Notes) the
+                         "title" IS the secret.
+  * PII filenames      : a filename can itself be the PII ("visa 4111 ... .csv").
+                         Filenames are run through the PII patterns before
+                         emission and withheld (hash + parent dir + size +
+                         mtime) when they match.
 
-Every user-facing string passes through redact() as a final chokepoint, which
-strips anything value-shaped (long high-entropy runs, anything after '='),
-so even an accidental leak in a path or title cannot escape. See the unit
-tests in tests/test_redaction.py.
+Every user-facing string passes through redact() as a final chokepoint. redact()
+scrubs control characters, collapses the string to a single line, strips URI
+userinfo, everything after '=', anything inside a sensitive-keyword proximity
+window, BIP-39 seed-phrase runs, and long high-entropy runs — so even an
+accidental leak in a path or title cannot escape. See tests/.
 
 SAFETY
 ------
-  * Read-only. No network. No decryption. No writes outside a temp dir that is
-    deleted in a finally block.
-  * SQLite DBs are copied to a temp path and opened
-    `mode=ro&immutable=1` so a running browser/Notes.app cannot cause a
-    "database is locked" error and so we can never mutate the original.
+  * Read-only. No network. No decryption. No writes outside a temp file that is
+    deleted in __exit__, in an atexit handler, and on SIGINT/SIGTERM.
+  * SQLite DBs are copied to a 0600 temp path and opened `mode=ro`.
+    See the comment on _TempCopyConn for why `immutable=1` was REMOVED.
+  * Report files (--out / --json) are created 0600 and moved into place with
+    os.replace(), so a partially written credential map is never observable.
 
 PERMISSIONS
 -----------
@@ -56,7 +66,8 @@ USAGE
 -----
     ./exposurescan.py                      # audit home dir, print markdown
     ./exposurescan.py --target ~/dev       # scope .env/PII scan to a subtree
-    ./exposurescan.py --json report.json   # also write a values-free JSON sidecar
+    ./exposurescan.py --json ~/.local/state/exposurescan/report.json
+                                           # values-free JSON sidecar (mode 0600)
     ./exposurescan.py --no-notes           # skip the Apple Notes surface
     ./exposurescan.py --out report.md      # write markdown to a file too
 
@@ -68,6 +79,7 @@ with the ShellGuard (zsh) and ClipSentinel layers in this kit.
 from __future__ import annotations
 
 import argparse
+import atexit
 import gzip
 import hashlib
 import json
@@ -75,12 +87,14 @@ import math
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import stat
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -184,9 +198,187 @@ MAX_FILE_BYTES = 5 * 1024 * 1024   # don't slurp anything over 5 MB for PII scan
 # ---------------------------------------------------------------------------
 
 # A "value-shaped" run: 20+ chars of base64/hex/token alphabet with no spaces.
-_VALUE_SHAPE = re.compile(r"[A-Za-z0-9+/=_\-]{20,}")
+#
+# '/' is deliberately NOT in this class. With it, the run crosses path
+# separators and `/Users/me/dev/some-project/.env` collapses to
+# `<redacted>.env` — which destroys the one thing a Location line is for.
+# Slash-bearing base64 blobs are still caught by _VALUE_SHAPE_LONG below, at a
+# length no filesystem path realistically reaches without a '.' or a space.
+_VALUE_SHAPE = re.compile(r"[A-Za-z0-9+=_\-]{20,}")
+_VALUE_SHAPE_LONG = re.compile(r"[A-Za-z0-9+/=_\-]{40,}")
+
+# One narrow exemption from the shape rules: an UPPER_SNAKE_CASE identifier.
+# `.env` KEY NAMES are the tool's primary output and routinely run past 20 chars
+# (NEXT_PUBLIC_SUPABASE_ANON_KEY is 29), so without this the report degrades to
+# a list of "<redacted>". The shape is deliberately unambiguous — every segment
+# uppercase/digits, separated by underscores, no lowercase, capped at 64 chars.
+# A credential in that shape does not occur in the wild; anything with a
+# lowercase char, a hyphen, '+', '/' or '=' is NOT exempt and still dies.
+_KEY_NAME_SHAPE = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")
+
+
+def _shape_sub(match: re.Match) -> str:
+    run = match.group(0)
+    if len(run) <= 64 and _KEY_NAME_SHAPE.match(run):
+        return run
+    return "<redacted>"
+
 # Anything that looks like KEY=VALUE — we keep the key, nuke the value.
-_ASSIGNMENT = re.compile(r"(=)\s*\S+")
+#
+# v0.1.0 BUG (fixed): this was `(=)\s*\S+`, which stops at the first space, so
+# `wifi password = correct horse battery staple` became
+# `wifi password = <redacted> horse battery staple` — three of the four words
+# survived AND the literal "<redacted>" made the line read as sanitized. The
+# value runs to end of line, so the pattern must too.
+_ASSIGNMENT = re.compile(r"(=)\s*.+$", re.M)
+
+# Control characters (C0 minus \t\n, DEL, C1). ANSI escape sequences start with
+# \x1b, which lives in this class — a title containing "\x1b[31m" would
+# otherwise be replayed straight into the user's terminal.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+# scheme://user:password@host — the userinfo segment is a credential and holds
+# no spaces, so neither the assignment rule nor the entropy rule catches it.
+# `postgres://admin:hunter2@db.internal:5432/prod` passed through untouched.
+_URI_CREDS = re.compile(r"(\b[A-Za-z][A-Za-z0-9+.\-]*://)[^\s/@]*@")
+
+# --- Proximity rule -------------------------------------------------------
+# A short, low-entropy secret next to a keyword ("PIN 4821", "password hunter2")
+# is invisible to every shape-based rule. So: when a sensitive keyword appears
+# as a whole word and is followed within PROXIMITY_WINDOW chars by a separator
+# (':', '=' or whitespace) plus content, the rest of the LINE is redacted.
+#
+# The separator set deliberately excludes '-' and '_' so the tool's own
+# vocabulary ("session-cookie host(s)", "seed-phrase", "STRIPE_SECRET_KEY")
+# does not self-redact.
+PROXIMITY_WINDOW = 64
+_PROXIMITY_RE: re.Pattern | None = None
+
+
+def _proximity_re() -> re.Pattern:
+    global _PROXIMITY_RE
+    if _PROXIMITY_RE is None:
+        words = sorted(
+            {w.lower() for w in SENSITIVE_KEY_HINTS}
+            | {c.lower() for c in SENSITIVE_CONTENT_CATEGORIES},
+            key=len, reverse=True,
+        )
+        _PROXIMITY_RE = re.compile(
+            r"\b(?:" + "|".join(re.escape(w) for w in words) + r")\b(?=[:=\s])",
+            re.I,
+        )
+    return _PROXIMITY_RE
+
+
+# --- BIP-39 seed phrases --------------------------------------------------
+# A 12/24-word mnemonic is the single highest-value secret this tool can meet,
+# and it is 100% invisible to shape-based redaction: every token is a short
+# lowercase dictionary word and the longest unbroken run is ~8 chars.
+# v0.1.0 emitted such a title BYTE-IDENTICAL.
+#
+# Wordlist source (verified 2048 lines,
+# sha256 2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda):
+#   https://raw.githubusercontent.com/bitcoin/bips/master/bip-0039/english.txt
+BIP39_PATH = Path(__file__).resolve().parent / "bip39.txt"
+SEED_RUN_MIN = 6           # >= 6 consecutive wordlist tokens => REDACT as a seed
+# Detection (raising a P0 finding) uses a much higher bar than redaction.
+# Redaction should over-fire; a false-positive P0 on an ordinary shopping list
+# trains the user to ignore the report. Real mnemonics are 12/18/24 words.
+SEED_DETECT_MIN = 11
+_BIP39_WORDS: frozenset[str] | None = None
+_BIP39_WARNED = False
+_WORD_TOKEN = re.compile(r"[A-Za-z]+")
+
+
+def _bip39_words() -> frozenset[str]:
+    """Lazily load the BIP-39 English wordlist. Degrades to empty on failure."""
+    global _BIP39_WORDS, _BIP39_WARNED
+    if _BIP39_WORDS is None:
+        try:
+            raw = BIP39_PATH.read_text(encoding="utf-8")
+            words = {
+                ln.strip().lower() for ln in raw.splitlines()
+                if ln.strip() and not ln.lstrip().startswith("#")
+            }
+            _BIP39_WORDS = frozenset(words)
+        except OSError:
+            _BIP39_WORDS = frozenset()
+        if not _BIP39_WORDS and not _BIP39_WARNED:
+            _BIP39_WARNED = True
+            # Names the missing FILE only. Never echoes the text that would
+            # have been checked against it.
+            print(
+                f"[exposurescan] warning: {BIP39_PATH.name} missing or empty; "
+                "seed-phrase redaction is DISABLED for this run.",
+                file=sys.stderr,
+            )
+    return _BIP39_WORDS
+
+
+def _redact_seed_phrases(text: str) -> str:
+    words = _bip39_words()
+    if not words:
+        return text
+    toks = list(_WORD_TOKEN.finditer(text))
+    if len(toks) < SEED_RUN_MIN:
+        return text
+    out: list[str] = []
+    cursor = 0
+    run_start = 0
+    i = 0
+    n = len(toks)
+    while i < n:
+        if toks[i].group(0).lower() in words:
+            run_start = i
+            j = i
+            while j + 1 < n and toks[j + 1].group(0).lower() in words:
+                j += 1
+            if (j - run_start + 1) >= SEED_RUN_MIN:
+                out.append(text[cursor:toks[run_start].start()])
+                out.append("<redacted seed-phrase>")
+                cursor = toks[j].end()
+            i = j + 1
+        else:
+            i += 1
+    out.append(text[cursor:])
+    return "".join(out)
+
+
+def looks_like_mnemonic(text: str, min_run: int = SEED_DETECT_MIN) -> bool:
+    """
+    True if `text` contains a long run of consecutive BIP-39 wordlist tokens.
+
+    Found while writing the regression suite: SENSITIVE_CONTENT_CATEGORIES
+    only ever matched the LABEL ("seed phrase", "recovery phrase", "mnemonic").
+    A note containing nothing but the twelve words — the actual catastrophic
+    case — was not detected at all. Detection was as broken as redaction.
+    """
+    words = _bip39_words()
+    if not words:
+        return False
+    run = 0
+    for tok in _WORD_TOKEN.findall(text):
+        if tok.lower() in words:
+            run += 1
+            if run >= min_run:
+                return True
+        else:
+            run = 0
+    return False
+
+
+def _apply_proximity(line: str) -> str:
+    pat = _proximity_re()
+    m = pat.search(line)
+    if not m:
+        return line
+    tail = line[m.end():]
+    lead = len(tail) - len(tail.lstrip(" \t:="))
+    if lead > PROXIMITY_WINDOW:
+        return line
+    if not tail[lead:].strip():
+        return line          # keyword ends the line; nothing to hide
+    return line[:m.end()] + " <redacted>"
 
 
 def shannon_entropy(s: str) -> float:
@@ -219,17 +411,66 @@ def classify_value_prefix(value: str) -> str | None:
 
 def redact(text: str) -> str:
     """
-    Final safety chokepoint. Strip anything value-shaped from any string that
-    is about to be shown to the user or written to a report. Defense in depth:
-    even if a code path forgot to drop a value, it cannot escape this funnel.
+    Final safety chokepoint. Every string that is about to be shown to the user
+    or written to a report passes through here. Defense in depth: even if a code
+    path forgot to drop a value, it cannot escape this funnel.
+
+    Order matters. Structural neutralisation first (control chars, newlines),
+    then the rules that key off structure (URI userinfo, '=', keyword
+    proximity), then dictionary/shape rules that scan whatever is left.
     """
     if text is None:
         return ""
-    # Kill "key = <value>" -> "key = <redacted>"
-    redacted = _ASSIGNMENT.sub(r"\1 <redacted>", text)
-    # Kill any remaining long high-entropy run.
-    redacted = _VALUE_SHAPE.sub("<redacted>", redacted)
-    return redacted
+    if not isinstance(text, str):
+        text = str(text)
+
+    # 1. Control characters -> U+FFFD. Kills ANSI escapes (\x1b), NUL, and the
+    #    C1 range before anything else can act on them or reach a terminal.
+    out = _CONTROL_CHARS.sub("�", text)
+    # 2. Collapse to ONE line. A newline in a note title or filename otherwise
+    #    forges markdown structure ("\n### P0 — INJECTED FINDING").
+    out = out.replace("\r", " ").replace("\n", " ")
+    # 3. scheme://user:pass@host
+    out = _URI_CREDS.sub(r"\1<redacted>@", out)
+    # 4. key = value  (to end of line)
+    out = _ASSIGNMENT.sub(r"\1 <redacted>", out)
+    # 5. sensitive keyword + separator -> redact to end of line
+    out = _apply_proximity(out)
+    # 6. BIP-39 mnemonics
+    out = _redact_seed_phrases(out)
+    # 7. Any remaining long high-entropy run. Long/slash-bearing first, so a
+    #    base64 blob is not chopped into per-segment "<redacted>" confetti.
+    out = _VALUE_SHAPE_LONG.sub(_shape_sub, out)
+    out = _VALUE_SHAPE.sub(_shape_sub, out)
+    return out
+
+
+# Characters that let an interpolated string forge markdown structure. Escaped
+# at the LEADING position (headings, blockquotes, lists), plus '|' and '`'
+# anywhere (tables and code spans).
+_MD_LEADING = "#>-|`+*=_"
+
+
+def markdown_safe(text: str) -> str:
+    """redact(), then neutralise markdown metacharacters. One line, always."""
+    s = redact(text)
+    s = s.split("\n")[0]
+    s = s.replace("`", "\\`").replace("|", "\\|")
+    if s[:1] in _MD_LEADING:
+        s = "\\" + s
+    return s
+
+
+# Generated metadata (value SHAPES, counts, permission bits) is built entirely
+# from ints and a fixed label vocabulary, so it never contains a secret and must
+# not be fed to redact() — the proximity rule would eat labels like
+# "AWS access key id". This validator is the belt to that suspenders: anything
+# outside a conservative alphabet is dropped.
+_SHAPE_ALLOWED = re.compile(r"[^A-Za-z0-9 ,.:;/+()\-]")
+
+
+def safe_shape(text: str) -> str:
+    return _SHAPE_ALLOWED.sub("", text or "")[:120]
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +488,12 @@ class Finding:
     pivot: str = ""       # what an attacker pivots into
     remediation: str = "" # how to shrink the blast radius
     location: str = ""    # path/origin (a NAME, never a value)
+    # Generated metadata about a value's SHAPE (lengths, entropy flag, prefix
+    # class). Built from ints + a fixed label vocabulary, so it is value-free by
+    # construction and is filtered through safe_shape() instead of redact() —
+    # redact()'s proximity rule would otherwise eat labels like
+    # "AWS access key id" and "Postgres connection URI".
+    shape: str = ""
 
     def hashed_id(self) -> str:
         """Stable, value-free id for week-over-week diffing in the JSON sidecar."""
@@ -263,6 +510,7 @@ class Finding:
             "category": self.category,
             "count": self.count,
             "detail": redact(self.detail),
+            "value_shape": safe_shape(self.shape),
             "pivot": self.pivot,
             "remediation": self.remediation,
             "location": redact(self.location),
@@ -285,11 +533,82 @@ class ScanResult:
 # Shared helper: copy a (possibly locked) sqlite DB and open it read-only.
 # ---------------------------------------------------------------------------
 
+_TEMP_SIDECARS = ("", "-wal", "-shm", "-journal")
+_TEMP_PATHS: set[str] = set()
+_TEMP_LOCK = threading.Lock()
+
+
+def _register_temp(p: Path) -> None:
+    with _TEMP_LOCK:
+        _TEMP_PATHS.add(str(p))
+
+
+def _purge_temp(base: str) -> None:
+    for suffix in _TEMP_SIDECARS:
+        try:
+            os.unlink(base + suffix)
+        except OSError:
+            pass
+
+
+def _cleanup_temps() -> None:
+    """Unlink every temp credential-DB copy we know about. Idempotent."""
+    with _TEMP_LOCK:
+        bases = list(_TEMP_PATHS)
+        _TEMP_PATHS.clear()
+    for base in bases:
+        _purge_temp(base)
+
+
+atexit.register(_cleanup_temps)
+
+
+def _install_signal_handlers() -> None:
+    """
+    A SIGTERM/SIGINT mid-copy would otherwise orphan a plaintext copy of the
+    browser's Login Data in TMPDIR, with no process left to clean it up.
+    atexit alone does not run on a signal.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def _handler(signum, _frame):
+        _cleanup_temps()
+        raise SystemExit(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT, getattr(signal, "SIGHUP", None)):
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError, RuntimeError):
+            pass
+
+
 class _TempCopyConn:
     """
-    Context manager that copies an sqlite file to a temp path and opens it
-    read-only + immutable, so a running app can't lock us out and we can never
-    mutate the original. Temp file is deleted in __exit__.
+    Context manager that copies an sqlite file to a private 0600 temp path and
+    opens it read-only, so a running app can't lock us out and we can never
+    mutate the original. Temp file is deleted in __exit__, on an exception
+    inside __enter__, at process exit, and on SIGINT/SIGTERM/SIGHUP.
+
+    WAL / immutable tradeoff (v0.1.0 bug, decided in v0.1.1)
+    -------------------------------------------------------
+    v0.1.0 copied the -wal sidecar AND opened with `mode=ro&immutable=1`.
+    `immutable=1` tells SQLite the file cannot change, so it skips WAL recovery
+    entirely and reads only the main database. Measured: a DB with 50 rows
+    parked in an uncheckpointed WAL reported "no such table" under
+    `immutable=1` and the correct 50 rows under plain `mode=ro`. In other
+    words the tool silently UNDER-COUNTED the most recent logins and cookies —
+    in a report whose entire output is a risk score.
+
+    Decision: keep the -wal copy, DROP `immutable=1`.
+      * Cost of dropping it: SQLite needs to create a -shm next to the copy and
+        may replay the WAL. Both happen inside our own temp dir, on our own
+        0600 copy — never on the user's file, which we only ever read via
+        shutil.copyfile. The -shm is registered for cleanup like the rest.
+      * Cost of the alternative (dropping the -wal copy): the report keeps
+        lying about recency, which is the failure mode that matters. Rejected.
     """
 
     def __init__(self, src: Path):
@@ -301,34 +620,48 @@ class _TempCopyConn:
         fd, tmp_name = tempfile.mkstemp(prefix="exposurescan_", suffix=".sqlite")
         os.close(fd)
         self.tmp = Path(tmp_name)
-        shutil.copy2(self.src, self.tmp)
-        # Some browser DBs ship -wal/-shm sidecars; copy if present so the
-        # read sees a consistent snapshot.
-        for sidecar in (".sqlite-wal", "-wal", ".sqlite-shm", "-shm"):
-            cand = Path(str(self.src) + sidecar.replace(".sqlite", ""))
-            # best-effort; ignore if absent
-            try:
-                if cand.exists():
-                    shutil.copy2(cand, Path(str(self.tmp) + sidecar.replace(".sqlite", "")))
-            except OSError:
-                pass
-        uri = f"file:{self.tmp}?mode=ro&immutable=1"
-        self.conn = sqlite3.connect(uri, uri=True)
+        _register_temp(self.tmp)
+        try:
+            # copyfile, NOT copy2. copy2 runs copystat, which replays the
+            # SOURCE's mode onto the destination — widening mkstemp's 0600 back
+            # to Login Data's 0644 and leaving a world-readable plaintext copy
+            # of the credential DB in TMPDIR for the life of the scan.
+            shutil.copyfile(self.src, self.tmp)
+            os.chmod(self.tmp, 0o600)
+            for suffix in ("-wal", "-shm"):
+                cand = Path(str(self.src) + suffix)
+                try:
+                    if cand.exists():
+                        dst = Path(str(self.tmp) + suffix)
+                        shutil.copyfile(cand, dst)
+                        os.chmod(dst, 0o600)
+                except OSError:
+                    pass
+            uri = f"file:{self.tmp}?mode=ro"
+            self.conn = sqlite3.connect(uri, uri=True)
+        except BaseException:
+            # A TCC PermissionError (or Ctrl-C) mid-copy must not orphan a
+            # partial credential DB in TMPDIR.
+            self._cleanup()
+            raise
         return self.conn
 
-    def __exit__(self, *exc) -> None:
+    def _cleanup(self) -> None:
         try:
             if self.conn is not None:
                 self.conn.close()
+        except sqlite3.Error:
+            pass
         finally:
+            self.conn = None
             if self.tmp is not None:
-                for suffix in ("", "-wal", "-shm"):
-                    p = Path(str(self.tmp) + suffix)
-                    try:
-                        if p.exists():
-                            p.unlink()
-                    except OSError:
-                        pass
+                base = str(self.tmp)
+                _purge_temp(base)
+                with _TEMP_LOCK:
+                    _TEMP_PATHS.discard(base)
+
+    def __exit__(self, *exc) -> None:
+        self._cleanup()
 
 
 # ---------------------------------------------------------------------------
@@ -462,7 +795,10 @@ def scan_browser_logins(result: ScanResult) -> None:
                 result.add(Finding(
                     surface="browser-login",
                     tier="P2",
-                    name=f"{len(hv)} high-value session-cookie host(s)",
+                    # Worded so the proximity rule has nothing to truncate:
+                    # "cookie"/"session" are themselves sensitive keywords, so
+                    # they must not be followed by content on this line.
+                    name=f"{len(hv)} high-value host(s) with saved session-cookies",
                     category="session-cookie",
                     count=len(hv),
                     detail="hosts: " + ", ".join(hv[:8]) + ("…" if len(hv) > 8 else ""),
@@ -479,29 +815,63 @@ def scan_browser_logins(result: ScanResult) -> None:
 # Surface (b): Apple Notes (NoteStore.sqlite -> gzip ZDATA -> regex categories)
 # ---------------------------------------------------------------------------
 
+# Core Data stores dates as seconds since 2001-01-01 UTC.
+_CORE_DATA_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
+
+
+def _core_data_date(value) -> str:
+    """Format a Core Data timestamp as an ISO-ish date. Value-free by nature."""
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    try:
+        return (_CORE_DATA_EPOCH + timedelta(seconds=ts)).strftime("%Y-%m-%d %H:%M UTC")
+    except (OverflowError, OSError, ValueError):
+        return "unknown"
+
+
+def _match_categories(text: str) -> set[str]:
+    """Return the set of sensitive-content category NAMES that matched."""
+    cats = {cat for cat, pat in SENSITIVE_CONTENT_CATEGORIES.items() if pat.search(text)}
+    # The regexes above only match the LABEL of a seed phrase. A bare mnemonic
+    # carries no label — check the wordlist directly.
+    if looks_like_mnemonic(text):
+        cats.add("seed-phrase")
+    return cats
+
+
 def scan_apple_notes(result: ScanResult) -> None:
     home = Path.home()
     store = home / "Library" / "Group Containers" / "group.com.apple.notes" / "NoteStore.sqlite"
     if not store.exists():
         result.note("Apple Notes: NoteStore.sqlite not found (no notes or no access).")
         return
+    _scan_notestore(result, store)
 
+
+def _scan_notestore(result: ScanResult, store: Path) -> None:
+    """Split out from scan_apple_notes so tests can drive a synthetic store."""
     try:
         with _TempCopyConn(store) as conn:
             cur = conn.cursor()
             # ZICNOTEDATA.ZDATA holds the gzipped protobuf note body.
-            # ZICCLOUDSYNCINGOBJECT.ZTITLE1 holds the note title (may vary by
-            # macOS version; we fall back gracefully).
+            # ZICCLOUDSYNCINGOBJECT.ZTITLE1 is the note "title" — which Notes
+            # DERIVES FROM THE FIRST LINE OF THE BODY. It is not user-chosen and
+            # must never be emitted. ZMODIFICATIONDATE1 is what actually lets a
+            # user find the note again.
             try:
                 cur.execute(
-                    "SELECT d.Z_PK, d.ZDATA, o.ZTITLE1 "
+                    "SELECT d.Z_PK, d.ZDATA, o.ZTITLE1, o.ZMODIFICATIONDATE1 "
                     "FROM ZICNOTEDATA d "
                     "LEFT JOIN ZICCLOUDSYNCINGOBJECT o ON o.ZNOTEDATA = d.Z_PK "
                     "WHERE d.ZDATA IS NOT NULL"
                 )
             except sqlite3.OperationalError:
                 # Older/newer schema: just pull the blobs without titles.
-                cur.execute("SELECT Z_PK, ZDATA, NULL FROM ZICNOTEDATA WHERE ZDATA IS NOT NULL")
+                cur.execute(
+                    "SELECT Z_PK, ZDATA, NULL, NULL FROM ZICNOTEDATA WHERE ZDATA IS NOT NULL"
+                )
             rows = cur.fetchall()
     except (sqlite3.Error, PermissionError, OSError) as e:
         result.note(
@@ -511,11 +881,9 @@ def scan_apple_notes(result: ScanResult) -> None:
         return
 
     locked = 0
-    category_counts: dict[str, int] = {}
-    # Track per-note titles we flagged so we can show TITLE + category only.
-    flagged_titles: dict[str, set[str]] = {}
+    flagged: list[tuple[int, int, str, set[str], set[str]]] = []
 
-    for pk, blob, title in rows:
+    for pk, blob, title, mdate in rows:
         if not blob:
             continue
         try:
@@ -532,24 +900,29 @@ def scan_apple_notes(result: ScanResult) -> None:
         except Exception:
             continue
 
-        note_title = (title or f"Untitled note #{pk}")
-        # Defensive: a malicious title could itself contain a value — redact it.
-        safe_title = redact(note_title)[:60]
-
-        for cat, pat in SENSITIVE_CONTENT_CATEGORIES.items():
-            if pat.search(text):
-                category_counts[cat] = category_counts.get(cat, 0) + 1
-                flagged_titles.setdefault(safe_title, set()).add(cat)
-        # text goes out of scope here; never stored, never printed.
+        cats = _match_categories(text)
+        if not cats:
+            continue
+        title_str = title if isinstance(title, str) else ""
+        # We test the TITLE too — but only to decide how loudly to withhold it.
+        title_cats = _match_categories(title_str) if title_str else set()
+        flagged.append((
+            int(pk) if pk is not None else -1,
+            len(title_str),
+            _core_data_date(mdate),
+            cats,
+            title_cats,
+        ))
+        # text and title_str go out of scope here; never stored, never printed.
 
     if locked:
         result.note(f"Apple Notes: {locked} locked/encrypted note(s) skipped (cannot read).")
 
-    if not category_counts:
+    if not flagged:
         result.note("Apple Notes: no notes matched sensitive-content categories.")
         return
 
-    for title, cats in sorted(flagged_titles.items()):
+    for pk, title_len, mtime, cats, title_cats in sorted(flagged):
         cat_list = ", ".join(sorted(cats))
         # Crypto seed phrases / private keys in a Note are catastrophic (P0):
         # an attacker who reads them drains a wallet irreversibly.
@@ -559,13 +932,22 @@ def scan_apple_notes(result: ScanResult) -> None:
             tier, pivot = "P2", "credential reuse / identity theft / fraud"
         else:
             tier, pivot = "P3", "identity theft / social engineering"
+        # Ordering matters: a category name is itself a proximity keyword, so
+        # the category list has to be LAST on the line or the withheld-title
+        # notice gets truncated by our own redaction rule.
+        detail = ""
+        if title_cats:
+            detail = "<title withheld - matched " + ", ".join(sorted(title_cats)) + "> ; "
+        detail += f"matched categories: {cat_list}"
         result.add(Finding(
             surface="apple-notes",
             tier=tier,
-            name=f"Note '{title}' — {cat_list}",
+            # NO TITLE. pk + length + mtime is enough to find the note in
+            # Notes.app (sort by Date Edited) and leaks nothing.
+            name=f"Note #{pk} (title {title_len} chars, modified {mtime}) - {cat_list}",
             category="note-secret",
             count=1,
-            detail=f"matched categories: {cat_list}",
+            detail=detail,
             pivot=pivot,
             remediation=(
                 "Move secrets/seed phrases out of plain Notes into a password "
@@ -666,10 +1048,14 @@ def scan_env_files(result: ScanResult, target: Path) -> None:
                 result.add(Finding(
                     surface="env-file",
                     tier=max_tier_for_file if max_tier_for_file == "P0" else "P1",
-                    name=f"{key} (value: {shape_str})",
+                    # The KEY NAME is untrusted text and goes through redact()
+                    # downstream. The value SHAPE is generated metadata and
+                    # travels in its own value-free field.
+                    name=f"{key}",
                     category="env-key",
                     count=1,
                     detail=f"line {lineno}",
+                    shape=shape_str,
                     pivot=(
                         "an attacker with disk access reads this plaintext key "
                         "and pivots into the live service it unlocks"
@@ -697,7 +1083,8 @@ def scan_env_files(result: ScanResult, target: Path) -> None:
                 name=f"{env_path.name}: {sensitive_keys}/{total_keys} sensitive key(s){perm_warn}",
                 category="env-file-summary",
                 count=sensitive_keys,
-                detail=", ".join(sorted(prefix_classes)) if prefix_classes else "",
+                detail="",
+                shape=", ".join(sorted(prefix_classes)) if prefix_classes else "",
                 pivot="bulk credential exposure for one project",
                 remediation="chmod 600; gitignore; migrate to a secrets manager.",
                 location=redact(str(env_path)),
@@ -748,15 +1135,18 @@ def scan_dot_secrets(result: ScanResult) -> None:
         tier = "P0" if world_or_group else "P1"
         perm_note = f"chmod {oct(mode)[-3:]}"
         if world_or_group:
-            perm_note += " — GROUP/OTHER READABLE"
+            perm_note += " - GROUP/OTHER READABLE"
         # The FILE NAME is the credential name; we report it + size + perms.
         result.add(Finding(
             surface="dot-secrets",
             tier=tier,
-            name=f"{p.name} ({size} bytes, {perm_note})",
+            name=f"{p.name}",
             category="flat-secret-file",
             count=1,
-            detail="single-value secret file (name = credential)",
+            # Worded so the proximity rule has nothing to truncate: "secret"
+            # and "credential" are themselves sensitive keywords.
+            detail="flat file whose name identifies the credential",
+            shape=f"{size} bytes, {perm_note}",
             pivot="direct read of a live credential by anyone with disk access",
             remediation=(
                 "chmod 600 each file; consider moving into the macOS Keychain; "
@@ -776,7 +1166,7 @@ def scan_pii_markers(result: ScanResult) -> None:
 
     # Aggregate counts per PII type across all scanned files; report top files.
     type_totals: dict[str, int] = {t: 0 for t in PII_PATTERNS}
-    per_file_hot: list[tuple[str, dict[str, int]]] = []
+    per_file_hot: list[tuple[Path, dict[str, int]]] = []
 
     for base in targets:
         if not base.exists():
@@ -809,8 +1199,18 @@ def scan_pii_markers(result: ScanResult) -> None:
                     type_totals[ptype] += n
                     # matches go out of scope here — instances never stored/printed.
 
+                # The FILENAME is PII too. v0.1.0 only ever scanned contents, so
+                # "visa 4111 1111 1111 1111 exp 0327 cvv 415.csv" with a benign
+                # body was invisible to the scan AND, once any other file put it
+                # in the report, printed verbatim.
+                for ptype in _pii_matches_in(path.name):
+                    file_counts[ptype] = file_counts.get(ptype, 0) + 1
+                    type_totals[ptype] += 1
+
                 if file_counts:
-                    per_file_hot.append((redact(str(path)), file_counts))
+                    # Keep the real Path: the filename itself has to be
+                    # PII-screened before it can be emitted (see _pii_file_label).
+                    per_file_hot.append((path, file_counts))
         except (PermissionError, OSError) as e:
             result.note(f"PII scan: stopped early in {redact(str(base))} ({e.__class__.__name__}).")
 
@@ -827,7 +1227,11 @@ def scan_pii_markers(result: ScanResult) -> None:
         name=f"{grand_total} PII marker(s) across Desktop/Documents/Downloads",
         category="pii-aggregate",
         count=grand_total,
-        detail=type_summary,
+        # Counts, not instances -> value-free generated metadata. It also has to
+        # live here because "sin-ssn: 2" would trip redact()'s own proximity
+        # rule ("sin-ssn" is a sensitive-category keyword).
+        detail="",
+        shape=type_summary,
         pivot="identity theft / targeted social engineering (no direct system pivot)",
         remediation=(
             "Move documents containing SIN/SSN/card numbers into an encrypted "
@@ -839,20 +1243,68 @@ def scan_pii_markers(result: ScanResult) -> None:
 
     # ... plus the hottest few files by total marker count (names only).
     per_file_hot.sort(key=lambda t: sum(t[1].values()), reverse=True)
-    for path_str, counts in per_file_hot[:8]:
+    for path, counts in per_file_hot[:8]:
         summary = ", ".join(f"{k}: {v}" for k, v in counts.items())
         has_high = any(k in counts for k in ("sin-ssn", "credit-card"))
+        label, location, shape = _pii_file_label(path)
         result.add(Finding(
             surface="pii",
             tier="P2" if has_high else "P3",
-            name=f"{Path(path_str).name} — {summary}",
+            name=label,
             category="pii-file",
             count=sum(counts.values()),
-            detail=summary,
+            detail="",
+            shape=f"{summary}{'; ' + shape if shape else ''}",
             pivot="identity theft / financial fraud" if has_high else "identity theft",
             remediation="Encrypt or delete this file; remove SIN/card data from cleartext.",
-            location=path_str,
+            location=location,
         ))
+
+
+def _pii_matches_in(text: str) -> list[str]:
+    """Which PII categories does this string itself contain? (Luhn-checked.)"""
+    hits: list[str] = []
+    for ptype, pat in PII_PATTERNS.items():
+        # finditer, not findall: several patterns have capturing groups and
+        # findall would hand back group tuples instead of the matched text.
+        found = [m.group(0) for m in pat.finditer(text)]
+        if not found:
+            continue
+        if ptype == "credit-card" and not any(_luhn_ok(_digits(m)) for m in found):
+            continue
+        hits.append(ptype)
+    return sorted(hits)
+
+
+def _pii_file_label(path: Path) -> tuple[str, str, str]:
+    """
+    Return (name, location, shape) for a PII-hot file.
+
+    v0.1.0 emitted `f"{Path(path_str).name} - {summary}"`, so a file called
+    "visa 4111 1111 1111 1111 exp 0327 cvv 415.csv" was reproduced verbatim into
+    stdout, the --out markdown AND the --json sidecar — helpfully annotated
+    "credit-card: 1". The FILENAME is one of the places PII actually lives, so
+    it has to be screened by the same patterns as the contents.
+    """
+    fname = path.name
+    cats = _pii_matches_in(fname)
+    try:
+        st = path.stat()
+        size = f"{st.st_size} bytes"
+        mtime = datetime.fromtimestamp(st.st_mtime, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except OSError:
+        size, mtime = "unknown size", "unknown"
+    if not cats:
+        return fname, str(path), f"{size}, modified {mtime}"
+    digest = hashlib.sha256(fname.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+    parent = str(path.parent)
+    # The parent dir is emitted so the file is still findable; the basename is
+    # replaced by a stable hash so week-over-week diffing still works.
+    label = (
+        f"<filename withheld - matched {', '.join(cats)}> (#{digest}) "
+        f"in {parent}/ ({size}, {mtime})"
+    )
+    return label, f"{parent}/<withheld #{digest}>", ""
 
 
 def _digits(s: str) -> str:
@@ -892,7 +1344,7 @@ def render_markdown(result: ScanResult, target: Path) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines: list[str] = []
     lines.append("# ExposureScan — Blast-Radius Self-Audit\n")
-    lines.append(f"_Generated {now} · scope: `{redact(str(target))}`_\n")
+    lines.append(f"_Generated {now} · scope: {markdown_safe(str(target))}_\n")
     lines.append(
         "> **Names and counts only.** Secret values were never read, decrypted, "
         "stored, or printed. This is a defensive self-audit, not an extractor.\n"
@@ -921,12 +1373,17 @@ def render_markdown(result: ScanResult, target: Path) -> str:
         lines.append(f"## {t} — {sev}\n")
         lines.append(f"_{meaning}_\n")
         for f in sorted(findings, key=lambda x: (x.surface, x.name)):
-            lines.append(f"### {redact(f.name)}")
+            # markdown_safe = redact() + single line + escaped metacharacters.
+            # Without it a note title containing "\n### P0 - INJECTED FINDING"
+            # forges a finding in the rendered report.
+            lines.append(f"### {markdown_safe(f.name)}")
             lines.append(f"- **Surface:** {f.surface}")
             lines.append(f"- **Category:** {f.category}")
-            lines.append(f"- **Location:** {redact(f.location)}")
+            lines.append(f"- **Location:** {markdown_safe(f.location)}")
             if f.detail:
-                lines.append(f"- **Detail:** {redact(f.detail)}")
+                lines.append(f"- **Detail:** {markdown_safe(f.detail)}")
+            if f.shape:
+                lines.append(f"- **Value shape:** {safe_shape(f.shape)}")
             lines.append(f"- **Attacker pivots into:** {f.pivot}")
             lines.append(f"- **Remediation:** {f.remediation}")
             lines.append("")
@@ -935,7 +1392,7 @@ def render_markdown(result: ScanResult, target: Path) -> str:
     if result.notes:
         lines.append("## Scan notes (skips & access)\n")
         for n in result.notes:
-            lines.append(f"- {redact(n)}")
+            lines.append(f"- {markdown_safe(n)}")
         lines.append("")
 
     # Tiered remediation checklist.
@@ -965,7 +1422,7 @@ def build_json_sidecar(result: ScanResult, target: Path) -> dict:
         by_tier_counts[f.tier] = by_tier_counts.get(f.tier, 0) + 1
     return {
         "tool": "exposurescan",
-        "version": "1.0.0",
+        "version": "0.2.0",
         "generated_utc": datetime.now(timezone.utc).isoformat(),
         "target": redact(str(target)),
         "invariant": "names-and-counts-only; no secret values present by construction",
@@ -978,6 +1435,33 @@ def build_json_sidecar(result: ScanResult, target: Path) -> dict:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+def write_private(path: Path, data: str) -> Path:
+    """
+    Write `data` to `path` with mode 0600, atomically.
+
+    A report file is a map of every credential surface on the machine. Written
+    with a plain write_text() it lands at the umask default (usually 0644) and
+    is observable, partially written, for the duration of the write. os.open
+    with an explicit 0600 + os.replace() closes both.
+    """
+    path = Path(os.path.expanduser(str(path)))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.exposurescan-{os.getpid()}.tmp"
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(data)
+        os.chmod(tmp, 0o600)     # explicit: do not inherit umask relaxation
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return path
+
 
 def run_scan(target: Path, *, do_notes: bool, do_browser: bool) -> ScanResult:
     result = ScanResult()
@@ -1028,6 +1512,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-browser", action="store_true", help="Skip the browser-login surface.")
     args = parser.parse_args(argv)
 
+    _install_signal_handlers()
+
     target = Path(os.path.expanduser(args.target)).resolve()
     if not target.exists():
         print(f"error: --target path does not exist: {target}", file=sys.stderr)
@@ -1043,15 +1529,13 @@ def main(argv: list[str] | None = None) -> int:
     print(markdown)
 
     if args.out:
-        out_path = Path(os.path.expanduser(args.out))
-        out_path.write_text(markdown)
-        print(f"\n[exposurescan] markdown written to {out_path}", file=sys.stderr)
+        out_path = write_private(Path(args.out), markdown)
+        print(f"\n[exposurescan] markdown written to {out_path} (mode 0600)", file=sys.stderr)
 
     if args.json:
         sidecar = build_json_sidecar(result, target)
-        json_path = Path(os.path.expanduser(args.json))
-        json_path.write_text(json.dumps(sidecar, indent=2))
-        print(f"[exposurescan] JSON sidecar written to {json_path}", file=sys.stderr)
+        json_path = write_private(Path(args.json), json.dumps(sidecar, indent=2))
+        print(f"[exposurescan] JSON sidecar written to {json_path} (mode 0600)", file=sys.stderr)
 
     # Exit code reflects worst tier found (useful in launchd / CI).
     if any(f.tier == "P0" for f in result.findings):

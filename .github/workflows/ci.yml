@@ -39,6 +39,32 @@ jobs:
             zsh -n "$f"
           done
 
+  detection-corpus:
+    name: Detection corpus (macOS)
+    # MUST run on macOS, not ubuntu. `[[ =~ ]]` and glob ranges bind to the
+    # platform's regex library, so a Linux-green corpus would not prove macOS
+    # behaviour — and macOS is the only platform this kit runs on.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert every payload shape is classified correctly
+        # Also fails if either tool stops sourcing the shared grammar, or grows
+        # its own host allowlist / detection regex again. That drift is what let
+        # ShellGuard and ClipSentinel silently disagree on 6 of 13 payloads.
+        run: zsh tests/run-corpus.zsh
+
+  zle-integration:
+    name: ShellGuard blocks in a real shell (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Drive an interactive zsh over a pty and check a marker file
+        # The corpus proves the grammar. This proves the widget is actually
+        # wired up, that the confirmation prompt can be COMPLETED, and that an
+        # aborted payload genuinely does not execute. v0.1.0 shipped a
+        # confirmation gate that could not be completed at all.
+        run: zsh tests/test-zle-integration.zsh
+
   exposurescan-tests:
     name: ExposureScan redaction invariants
     runs-on: ubuntu-latest

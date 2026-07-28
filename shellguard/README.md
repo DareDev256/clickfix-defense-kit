@@ -114,15 +114,36 @@ command is pasted, before you even press Enter.
 Over-prompting is the #1 reason people disable a guard and then ignore it. ShellGuard
 ships with mitigations, all overridable in `~/.zshrc` **after** the source line.
 
-**1. Trusted-host allowlist.** If every download URL in a flagged command points at a
-well-known installer host, the guard stays silent. Defaults include `sh.rustup.rs`,
-`get.docker.com`, `raw.githubusercontent.com`, `install.python-poetry.org`,
-`get.pnpm.io`, `bun.sh`, and more. Extend it:
+**1. Trusted-installer allowlist.** If every download URL in a flagged command points
+at a trusted installer, the guard stays silent. There are two lists, and the
+distinction is load-bearing:
+
+- `CLICKFIX_ALLOW_HOSTS` — **single-tenant** hosts only, where the domain owner
+  controls every byte served: `sh.rustup.rs`, `get.docker.com`,
+  `install.python-poetry.org`, `get.pnpm.io`, `bun.sh`, and a few more.
+- `CLICKFIX_ALLOW_URL_PREFIXES` — scheme + host + **path prefix**, for hosts the
+  public can publish to: `raw.githubusercontent.com/ohmyzsh/`,
+  `raw.githubusercontent.com/Homebrew/`, `raw.githubusercontent.com/nvm-sh/`.
+
+> **Why the split.** v0.1.0 had bare `raw.githubusercontent.com` in the host
+> allowlist. Any GitHub account can publish an arbitrary script there with zero
+> review, so the guard was silently waving through
+> `curl …/<attacker>/<repo>/main/x.sh | sh` — it was telling an attacker where to
+> host the payload. **Never put a host the public can publish to in
+> `CLICKFIX_ALLOW_HOSTS`.** Use the URL-prefix list, which scopes trust to a
+> specific upstream project. There is deliberately no wildcard-subdomain rule.
 
 ```zsh
 # in ~/.zshrc, AFTER the shellguard source line:
-CLICKFIX_GUARD_ALLOW_HOSTS+=( my.internal-ci.example registry.example.com )
+CLICKFIX_ALLOW_HOSTS+=( my.internal-ci.example registry.example.com )
+CLICKFIX_ALLOW_URL_PREFIXES+=( raw.githubusercontent.com/my-org/ )
 ```
+
+**1b. Two tiers.** `block` demands a typed phrase and is reserved for unambiguous
+attack shapes. `warn` shows the banner and takes a single Enter, and is where
+heuristics with real false-positive rates live (two-step download-then-run,
+look-alike characters, `hdiutil attach`). The split exists so the typed phrase
+never becomes muscle memory — a guard people reflexively confirm is not a guard.
 
 > Note: payloads with **no** URL (a `base64 -d | sh` blob, a `/dev/tcp` reverse
 > shell) are never auto-trusted, because there's no host to vouch for them.
