@@ -195,7 +195,10 @@ do_list() {
     return 0
   fi
   # Pretty-print the ledger; flag any decoy that has since been deleted.
-  tail -n +2 "$LEDGER" | while IFS=$'\t' read -r marker path _kind _created; do
+  # NOTE: this loop PRINTS $kind, so the field must not be named _kind — under
+  # `set -u` an underscore-prefixed read target left $kind unbound and aborted
+  # `--list` on any non-empty ledger (fixed 2026-07-29).
+  tail -n +2 "$LEDGER" | while IFS=$'\t' read -r marker path kind _created; do
     if [ -e "$path" ]; then
       printf '  %s%-22s%s %-18s %s\n' "$GRN" "$marker" "$RST" "$kind" "$path"
     else

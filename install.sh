@@ -28,6 +28,13 @@
 #                                 ClipSentinel, WatchPost) + make scripts runnable
 #   ./install.sh uninstall        Interactive uninstall menu
 #   ./install.sh uninstall <tool> Uninstall a specific tool
+#   ./install.sh --verify         Run the integrity check only, then exit
+#
+# Integrity:
+#   Before touching your system this script verifies the checkout: it refuses to
+#   run if a tracked file was modified after cloning, and it reports whether the
+#   checked-out tag carries a good signature. Override with --force, after you
+#   have read the diff. See SECURITY.md -> "Verifying what you cloned".
 # ==============================================================================
 
 set -euo pipefail
@@ -193,12 +200,92 @@ uninstall_menu() {
 }
 
 usage() {
-  sed -n '3,40p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  sed -n '3,48p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+}
+
+# ---- integrity ---------------------------------------------------------------
+# Surface the protection that already exists rather than inventing a new one.
+#
+# Deliberately NOT a MANIFEST.sha256 in the tree: anyone who can edit a tracked
+# file can also re-run `shasum > MANIFEST.sha256` and make the manifest report
+# OK on a backdoored tree. `.git` is already a content-addressed manifest whose
+# hashes chain to a commit ID you can compare against GitHub, so the useful
+# check is `git status --porcelain` plus the tag signature.
+#
+# Returns 0 if the checkout looks clean, 1 otherwise. Never modifies anything.
+verify_checkout() {
+  local rc=0 dirty tag
+
+  if ! command -v git >/dev/null 2>&1 || ! git -C "$KIT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    warn "Not a git checkout — cannot verify integrity."
+    warn "Prefer 'git clone' over a downloaded zip so this check can run."
+    return 1
+  fi
+
+  dirty="$(git -C "$KIT_DIR" status --porcelain 2>/dev/null || true)"
+  if [ -n "$dirty" ]; then
+    err "Tracked files have been MODIFIED since checkout:"
+    printf '%s\n' "$dirty" | sed 's/^/      /'
+    err "A security tool should not install from a tree you did not verify."
+    err "Review with 'git diff', or re-run with --force if the changes are yours."
+    rc=1
+  else
+    say "  ${GRN}ok${RST} working tree is clean (no tracked file modified)"
+  fi
+
+  say "  ${DIM}commit ${RST}$(git -C "$KIT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)${DIM} — compare this against GitHub${RST}"
+
+  tag="$(git -C "$KIT_DIR" describe --exact-match --tags 2>/dev/null || true)"
+  if [ -n "$tag" ]; then
+    if git -C "$KIT_DIR" verify-tag "$tag" >/dev/null 2>&1; then
+      say "  ${GRN}ok${RST} tag $tag carries a good signature"
+    else
+      warn "tag $tag is not signed, or the signer is not in your allowed_signers."
+      warn "See SECURITY.md -> 'Verifying what you cloned' to set that up."
+    fi
+  else
+    warn "Not on a release tag. For the reviewed code, run: git checkout v0.1.1"
+  fi
+
+  return $rc
 }
 
 # ---- dispatch ----------------------------------------------------------------
 
 main() {
+  # --force anywhere in the args skips the integrity gate. Strip it so it does
+  # not fall through to the command dispatch as an unknown command.
+  local force=0 a
+  local -a args=()
+  for a in "$@"; do
+    if [ "$a" = "--force" ]; then force=1; else args+=("$a"); fi
+  done
+  set -- ${args[@]+"${args[@]}"}
+
+  case "${1:-}" in
+    --verify)
+      say "${BOLD}Checkout integrity${RST}"
+      verify_checkout && { say ""; say "${GRN}Checkout verified.${RST}"; exit 0; }
+      exit 1 ;;
+  esac
+
+  # Everything below touches the user's system, so gate it.
+  case "${1:-}" in
+    -h|--help|help) : ;;
+    *)
+      if [ "$force" -eq 0 ]; then
+        say "${BOLD}Checkout integrity${RST}"
+        if ! verify_checkout; then
+          say ""
+          err "Refusing to install from an unverified checkout. Use --force to override."
+          exit 1
+        fi
+        say ""
+      else
+        warn "--force: skipping the integrity check."
+      fi ;;
+  esac
+
   case "${1:-}" in
     ""|menu)        install_menu ;;
     -h|--help|help) usage ;;

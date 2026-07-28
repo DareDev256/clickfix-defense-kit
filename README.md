@@ -62,9 +62,22 @@ This is the part most people get wrong, so it's worth stating plainly:
   and pipes **straight into a shell** without ever landing as a launched file —
   never gets that attribute and never triggers a file-launch check. Gatekeeper is
   **structurally bypassed, not defeated.** There is nothing for it to scan.
-- **The macOS 26.4 Terminal paste-warning is warn-only and user-overridable**
-  ("Paste Anyway"), and it keys off the source app — so it provably misses a
-  `curl | bash` the page placed on the clipboard from a browser the user trusts.
+- **The macOS 26.4 Terminal paste-warning does not inspect what you pasted, and
+  on a developer's Mac it is usually not running at all.** Per public reversing
+  of `xprotectd` (Adam Codega, corroborated by Patrick Wardle), the alert does
+  not examine paste *contents* — pasting `hello world` triggers it too. It
+  matches the source app's signing identifier against a fixed list. What
+  actually matters is that it is **suppressed entirely** when developer tools
+  are present, when Terminal has been opened recently, and when SIP is
+  disabled. Every one of those describes this kit's audience, so Apple's paste
+  protection is effectively **inactive on exactly the machines most likely to be
+  attacked through a terminal**.
+
+  > *Correction:* v0.1.0 of this README said the alert "keys off the source app
+  > — so it provably misses a `curl | bash` from a browser the user trusts."
+  > That was wrong; a browser is precisely what it *does* flag. The real gap is
+  > the exemption conditions above, which is a stronger argument, and the kit
+  > was leaving it on the table while stating something falsifiable.
 - **TCC (Privacy & Security prompts)** gate *file-category* and *automation*
   access — but the malware runs through already-trusted, Apple-signed binaries
   (`Terminal`, `bash`, `osascript`) that inherit the user's own grants, and the
@@ -86,16 +99,18 @@ persist → exfiltrate**, plus a self-audit of what's already exposed.
 
 | Tool | Stage it covers | What it actually stops / does | Honest positioning vs. prior art |
 |------|-----------------|-------------------------------|----------------------------------|
-| **[ShellGuard](./shellguard)** | **Execute** | A zsh ZLE `accept-line` guard. Intercepts download/decode-and-execute commands (`curl\|sh`, `eval $(curl)`, `base64 -d\|sh`, `osascript\|sh`, `/dev/tcp` reverse shells) **at the moment you press Enter** and forces a typed confirmation phrase. | **The genuinely unoccupied control point on macOS.** Existing detections are Windows/PowerShell-focused, browser-side, or source-app heuristics that provably miss a pasted `curl\|bash`. ShellGuard gates at the last, most authoritative moment: execution. |
+| **[ShellGuard](./shellguard)** | **Execute** | A zsh guard that tokenizes the command you are about to run, and stops download/decode-and-execute shapes **at the moment you press Enter** — two tiers: a typed confirmation phrase for unambiguous attacks, a single Enter for heuristics. | **The zero-permission control point.** Objective-See's **BlockBlock** added ClickFix protection at Cmd+V in Feb 2026 and inspects real paste content — if you will install a system extension, run it. ShellGuard's remaining honest claim is narrower and still real: it needs **no root, no kext, no system extension and no TCC grant**, it is the only layer that fires on a **typed** (not pasted) command, and it gates at the last authoritative moment: execution. |
 | **[ExposureScan](./exposurescan)** | **Self-audit** | A read-only, **names-and-counts-only** scan of four surfaces (browser logins, Apple Notes, `.env` files, `~/.secrets`, plus PII markers) that prints a **blast-radius map ranked by pivot value** — never a single secret value. | **Inverts the trufflehog/gitleaks posture.** Those tools *find and print the value*. ExposureScan answers *"what would a stealer walk away with?"* with the values **architecturally absent from the code path**. That inversion is the product. |
-| **[ClipSentinel](./clipsentinel)** | **Copy** | A dependency-free clipboard watchdog. Fires a macOS notification the instant a dangerous command lands on your clipboard — the earliest interception point, before any terminal is involved. | Early-warning siren. It **cannot block a paste** (macOS exposes no API to). The authoritative block is ShellGuard; ClipSentinel buys you a beat of awareness first. |
+| **[ClipSentinel](./clipsentinel)** | **Copy** | A dependency-free clipboard watchdog. Fires a macOS notification the instant a dangerous command lands on your clipboard — the earliest interception point, before any terminal is involved. | **Use BlockBlock instead if you'll install a system extension** — since Feb 2026 it inspects actual paste content at Cmd+V and does this job better. ClipSentinel is the **zero-permission fallback**: nothing to approve, nothing to trust with root, which is the difference between a family member having *something* and having nothing. It cannot block a paste (macOS exposes no API to); the authoritative block is ShellGuard. |
 | **[Canary](./canary)** | **Detect breach** | A honeytoken generator. Plants traceable decoy credentials (fake AWS keys, `.env`, `passwords.txt`) where stealers grab them, with a walkthrough to wire them to **canarytokens.org** (network callback) and/or `eslogger` (local read-watch). | The network-callback half is **Thinkst Canarytokens' / Objective-See's** territory and they win it — this tool is the *turnkey placement + literacy layer* around them. The only additive sliver is the `eslogger` local-read tripwire for a "read-and-walk-away" attacker. |
 | **[WatchPost](./watchpost)** | **Persist** | A zero-dependency, cron-scheduled persistence + login-item baseline-diff for **unattended** Macs (e.g. a headless Mac Mini). Flags new/tampered LaunchAgents, LaunchDaemons, cron, and login items with a `codesign` verdict. | **Objective-See's BlockBlock/KnockKnock win the real-time, signing-aware version** — use those on a Mac you sit at. WatchPost's only non-duplicative slice is the **headless, notification-wired** diff for a machine where an interactive prompt can't reach you. |
 | **[GuestMode](./guestmode)** | **Contain** | A safe wrapper + manual guide for creating a **standard, non-admin** macOS account for movie night / family / guests, so a phished password can't escalate and the guest can't read your `~/dev` or `~/.secrets`. | A **stock-macOS** blast-radius reducer. No novelty in the mechanism — the value is packaging the right setting with the right honest explanation for the exact victim profile. Containment, not prevention. |
 
 > **A note on honesty (read it):** the kit's real novelty is **not** any single
-> monitor. It's three things stacked: (1) **ShellGuard's** execute-time zsh
-> grammar gate, a genuinely unoccupied control point on macOS; (2)
+> monitor. It's three things stacked: (1) **ShellGuard's** execute-time,
+> zero-permission grammar gate — no longer an *unoccupied* control point, since
+> BlockBlock now covers paste-time, but still the only one that needs no
+> system extension and the only one that sees a typed command; (2)
 > **ExposureScan's** names-and-counts-only, four-surface, blast-radius-framed
 > self-audit, which inverts the entire find-and-print-the-value posture of
 > secret scanners into a personal attack-surface map — and physically removing
@@ -184,10 +199,10 @@ This is education and self-defense. Treat it that way.
 
 ## The honest novelty, one more time
 
-If you only remember one thing: the differentiated, genuinely-new pieces are
-**ExposureScan** (the value-absent, blast-radius-framed self-audit) and
-**ShellGuard** (the execute-time zsh grammar gate on a control point nothing else
-occupies on macOS). Everything else is careful glue, honest packaging, and a
+If you only remember one thing: the differentiated pieces are **ExposureScan**
+(the value-absent, blast-radius-framed self-audit) and **ShellGuard** (the
+execute-time grammar gate that costs the user no permission grant at all).
+Everything else is careful glue, honest packaging, and a
 literacy layer aimed at the real-world ClickFix victim — the tired person on the
 couch trying to watch a movie — instead of the enterprise SOC. That victim was me.
 This is the kit I wish I'd had installed that night.
