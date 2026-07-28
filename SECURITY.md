@@ -114,6 +114,68 @@ maintainers.
 
 ---
 
+## Verifying what you cloned
+
+This kit asks for Full Disk Access and, for one optional layer, root. You should
+not take that on trust, and you should not have to. Two independent checks:
+
+**1. The tag is signed.** From `v0.1.1` onward, release tags are signed with an
+SSH key. Make this step zero, before you read or run anything:
+
+```sh
+git clone https://github.com/DareDev256/clickfix-defense-kit.git
+cd clickfix-defense-kit
+
+# fetch the signer, then verify the tag
+mkdir -p ~/.config/git
+echo 'tdotssolutionsz@gmail.com namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ7WssTDYR71Z6KSSdrK/Xq2XipExLQl912nFRJlnQdX' \
+  >> ~/.config/git/allowed_signers   # full key below
+git config gpg.ssh.allowedSignersFile ~/.config/git/allowed_signers
+
+git verify-tag v0.1.1     # must print "Good \"git\" signature"
+git checkout v0.1.1
+```
+
+The signing key fingerprint is:
+
+```
+SHA256:ahS0yuup97TRBRmaRzk3iEbUlo/IK+VqXgd0sada2KU   (ED25519)
+```
+
+Verify that fingerprint out-of-band — against this file as served by GitHub over
+HTTPS, and against the release notes. A fingerprint you read only from a file you
+already cloned proves nothing on its own.
+
+**2. `.git` already is a content-addressed integrity manifest.** It is worth
+saying plainly, because the obvious-looking control is worse than useless:
+
+> A `MANIFEST.sha256` checked into the tree is **theatre**. Anyone who can modify
+> `shellguard.zsh` can re-run `shasum -a 256 … > MANIFEST.sha256` — the same
+> write access the tamper already required — and the manifest reports OK on a
+> backdoored tree. Meanwhile `git status --porcelain` reports the modification in
+> every case, and the object hashes chain to a commit ID you can compare against
+> GitHub. **Tamper detection is already solved. Do not trust a flat checksum file
+> inside the thing it is checksumming.**
+
+So, to confirm nothing was modified after cloning:
+
+```sh
+git status --porcelain     # any output = a tracked file was modified
+git rev-parse HEAD         # compare against the commit shown on GitHub
+```
+
+`install.sh` performs both of these before touching your system and refuses to
+proceed on a dirty tree.
+
+**What is still missing, stated plainly:** the signing key is not yet registered
+with GitHub as a signing key, so the web UI will show these tags as unverified
+even though `git verify-tag` succeeds locally. The Canary `eslogger` helper is
+unsigned and un-notarized, which is why the read-watch layer is documented rather
+than shipped enabled — granting root to an unsigned binary is itself a malware
+trust profile, and this project is not going to ask you to do that.
+
+---
+
 ## Published bypasses in v0.1.0 (fixed in v0.1.1)
 
 This project's pitch is that it refuses claims it cannot back. That has to
