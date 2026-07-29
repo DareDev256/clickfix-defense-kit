@@ -167,9 +167,13 @@ git rev-parse HEAD         # compare against the commit shown on GitHub
 `install.sh` performs both of these before touching your system and refuses to
 proceed on a dirty tree.
 
-**What is still missing, stated plainly:** the signing key is not yet registered
-with GitHub as a signing key, so the web UI will show these tags as unverified
-even though `git verify-tag` succeeds locally. The Canary `eslogger` helper is
+The key is registered with GitHub as a signing key, so tags also show as
+**Verified** in the web UI. Do not treat that badge as the check — it only means
+GitHub matched the signature to a key on this account. `git verify-tag` against
+the fingerprint above is the check, because you control the allowed-signers file
+and GitHub does not.
+
+**What is still missing, stated plainly:** the Canary `eslogger` helper is
 unsigned and un-notarized, which is why the read-watch layer is documented rather
 than shipped enabled — granting root to an unsigned binary is itself a malware
 trust profile, and this project is not going to ask you to do that.
