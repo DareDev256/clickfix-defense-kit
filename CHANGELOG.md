@@ -5,6 +5,90 @@ All notable changes to the ClickFix Defense Kit are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-07-29
+
+The kit was born from a breach and, until this release, had nothing for the hour
+after one. Repo-wide grep before this release: "revoke" 0 hits, "forwarding
+rule" 0, "deploy key" 0, "reinstall" 0.
+
+### Added — incident response
+
+- **`INCIDENT.md`** — an ordered runbook, written to be worked from a phone.
+  The ordering is the deliverable, not the content:
+  - **Crypto first.** It is the only irreversible loss. A seed phrase *is* the
+    wallet; "change the password" does nothing.
+  - **Kill sessions BEFORE changing passwords.** This is the step people invert.
+    A stolen cookie authenticates without the password and without 2FA, and a
+    password change does not reliably invalidate live sessions — so resetting
+    first and stopping there leaves the attacker signed in behind a new
+    password. ExposureScan already knew this and the kit never turned it into a
+    procedure.
+  - Revoke OAuth grants (they survive every password change) → passwords, email
+    first → mail-persistence sweep (forwarding, filters matching
+    `reset`/`verify`/`code`, send-as aliases, delegated access, app-specific
+    passwords, recovery address and phone).
+  - Developer tokens in blast-radius order: npm/PyPI publish tokens **first**
+    (a personal breach becomes a supply-chain breach), cloud keys
+    disable-then-delete so the audit trail survives, then PATs, SSH/GPG, and
+    per-repo deploy keys + Actions secrets — the most forgotten items, because
+    there is no revoke-all button.
+  - The reinstall decision as a bright line: *did anything get root?*
+- **`panic.sh`** — prints the checklist with no network, no browser and no
+  dependencies. `--short` fits a phone screen, `--paper` pipes to `lpr`,
+  `--triage` adds read-only probes that answer the root question with facts.
+  The ordered summary is hard-coded rather than parsed out of `INCIDENT.md`: if
+  the repo is damaged, the order is the part you cannot afford to lose.
+- **`preserve.sh`** — capture evidence before remediating. **Defers entirely to
+  Jamf Aftermath when installed** — free, Swift, purpose-built, collects a
+  superset. Built-in collector otherwise: 29 artifacts including
+  `kMDItemWhereFroms` origin URLs for recent downloads, sha256 + `codesign`
+  verdict per persistence plist, and TCC grants, sealed read-only with a
+  MANIFEST.
+
+### Added — ExposureScan
+
+- **`scan_dev_credentials`** — SSH keys (plaintext vs encrypted, header-read
+  only), 11 credential files by key name and mode, shell-history token counts by
+  line number, per-profile cookie counts, crypto wallet stores (20 extensions +
+  13 desktop bundles, unconditional P0), Firefox login counts so the report is
+  not silently Chrome-shaped.
+- **`--tcc`** — the grant inventory the README's central argument always implied
+  and never delivered. P0 for terminals, shells, SSH wrappers and bare
+  interpreters holding Full Disk Access / Accessibility / Screen Recording,
+  because those are grant-inheritance vehicles rather than apps. Bundles Secure
+  Keyboard Entry, remote-access services and Secure Boot level.
+- **Deliberately not built:** FileVault, firewall, update settings, sudoers, the
+  CIS sweep. mSCP and Pareto own that and own it better; they are cited instead.
+
+### Fixed — WatchPost baseline could be blinded
+
+- **Deleting `baseline.json` was treated as a first run.** The next run printed
+  "No diffing on first run" and silently absorbed whatever had just been planted
+  as legitimate. One `rm` permanently blinded the monitor. An `.armed` marker
+  now makes deletion an alertable event that refuses to re-baseline without an
+  explicit `--init`.
+- **Editing the baseline directly is now detected** via an HMAC tag —
+  pre-seeding it with an entry the attacker intends to create later would
+  otherwise make the real plant diff as already-known.
+- Baseline is **0600** in a **0700** directory; it was 0644 and enumerates every
+  persistence entry on the machine.
+- `--no-update` documented as *the* incident flag: a normal run promotes the
+  baseline and erases the diff that proved something appeared.
+- The README states the honest limit — the HMAC key sits beside the baseline
+  under the same user, so this is tamper-**evidence**, not tamper-proofing. The
+  root-owned variant that would be proof is named and explicitly not claimed.
+
+### Tests
+
+- `tests/test-watchpost-baseline.sh` — 10 checks covering all three blinding
+  attacks, plus the one that matters most: a genuinely new plant is **still**
+  reported after the hardening.
+- ExposureScan 47 → **72** tests. `tests/make-sample-report.py` regenerates
+  `sample-report.md` from the real scanner against a synthetic `$HOME`, with
+  `--check` failing when stale — so "generated, not hand-written" is enforced
+  rather than asserted.
+- New macOS CI job for the baseline tests.
+
 ## [0.1.1] — 2026-07-29
 
 **Security release. If you are running v0.1.0, upgrade.**

@@ -18,6 +18,9 @@ jobs:
         run: |
           shellcheck -S warning \
             install.sh \
+            panic.sh \
+            preserve.sh \
+            tests/test-watchpost-baseline.sh \
             canary/canary-gen.sh \
             guestmode/setup-guestmode.sh \
             shellguard/install.sh \
@@ -64,6 +67,17 @@ jobs:
         # aborted payload genuinely does not execute. v0.1.0 shipped a
         # confirmation gate that could not be completed at all.
         run: zsh tests/test-zle-integration.zsh
+
+  watchpost-baseline:
+    name: WatchPost baseline cannot be blinded (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pre-seed, delete and tamper with the baseline in a sandbox
+        # The baseline lives in the user's home dir, writable by exactly the
+        # malware this tool watches for. Deleting it used to be read as a first
+        # run, which silently absorbed whatever had just been planted.
+        run: bash tests/test-watchpost-baseline.sh
 
   exposurescan-tests:
     name: ExposureScan redaction invariants

@@ -125,6 +125,27 @@ persist → exfiltrate**, plus a self-audit of what's already exposed.
 
 ---
 
+## If you are in an incident right now
+
+Stop reading the rest of this page.
+
+```sh
+./panic.sh            # the checklist, offline, no browser needed
+./panic.sh --short    # the ordered summary, fits on a phone screen
+./panic.sh --triage   # ...plus live "did anything get root?" probes
+./preserve.sh         # capture evidence BEFORE you start cleaning up
+```
+
+Or open **[INCIDENT.md](./INCIDENT.md)** on your phone.
+
+The order in that document is the point. The step people get wrong is doing
+password resets first: **a stolen session cookie authenticates without your
+password and without your 2FA**, so sessions have to be killed first or the
+reset protects nothing. Crypto comes before even that, because it is the only
+step that cannot be undone.
+
+---
+
 ## Quick install
 
 Clone the repo, read the code, then run the top-level menu installer:

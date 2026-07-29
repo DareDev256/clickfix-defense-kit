@@ -10,7 +10,10 @@ A defensive, read-only self-audit that answers the question:
     "If an infostealer (AMOS / Atomic / Poseidon) ran on my Mac right now,
      what would it walk away with — and what could the attacker pivot into?"
 
-It inventories the four credential/PII surfaces a macOS stealer targets and
+It inventories the credential/PII surfaces a macOS stealer targets — browser
+logins and cookies, Apple Notes, .env files, ~/.secrets, PII, SSH keys and
+developer credential files, crypto wallets, the keychain, and (with --tcc) the
+TCC grants that malware inherits from the binary it runs inside — and
 prints a *prioritized blast-radius report*. It ranks surfaces by pivot value
 (P0 -> P3), not by raw count, so you fix the prod-key-in-a-.env before the
 phone number in a Note.
@@ -39,6 +42,20 @@ Secret VALUES never touch memory, never get printed, never get written to disk.
                          Filenames are run through the PII patterns before
                          emission and withheld (hash + parent dir + size +
                          mtime) when they match.
+  * SSH private keys   : we report FILENAME, key TYPE and ENCRYPTED vs
+                         PLAINTEXT. For an OPENSSH-format key we base64-decode
+                         only the first two body lines — enough for the header
+                         and the PUBLIC key blob — and stop before the private
+                         section. Key material is never decoded, never held.
+  * Dev credentials    : ~/.aws/credentials, ~/.npmrc, ~/.config/gh/hosts.yml,
+                         ~/.docker/config.json and friends are reported as
+                         presence + file MODE + KEY NAMES only. Values are
+                         never parsed out.
+  * Shell history      : secret-shaped runs in ~/.zsh_history / ~/.bash_history
+                         are reported as a COUNT plus LINE NUMBERS and a prefix
+                         CLASS. The matched text is never read into a finding.
+  * TCC grants (--tcc) : service + client identifier only, from a read-only
+                         copy of TCC.db. No values exist in that DB to leak.
 
 Every user-facing string passes through redact() as a final chokepoint. redact()
 scrubs control characters, collapses the string to a single line, strips URI
@@ -70,6 +87,8 @@ USAGE
                                            # values-free JSON sidecar (mode 0600)
     ./exposurescan.py --no-notes           # skip the Apple Notes surface
     ./exposurescan.py --out report.md      # write markdown to a file too
+    ./exposurescan.py --tcc                # add the TCC grant-inheritance
+                                           # inventory (read-only, no new grant)
 
 This tool reduces risk and raises literacy. It cannot stop you from pasting a
 curl|bash into Terminal or typing your password into a fake dialog. Pair it
@@ -80,6 +99,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import base64
 import gzip
 import hashlib
 import json
@@ -90,6 +110,7 @@ import shutil
 import signal
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -780,13 +801,43 @@ def scan_browser_logins(result: ScanResult) -> None:
         if not cookies_db.exists():
             cookies_db = pdir / "Network" / "Cookies"   # newer Chrome layout
         if cookies_db.exists():
+            rows_total = 0
             try:
                 with _TempCopyConn(cookies_db) as conn:
                     cur = conn.cursor()
                     cur.execute("SELECT DISTINCT host_key FROM cookies")
                     hosts = [r[0] for r in cur.fetchall()]
+                    cur.execute("SELECT count(*) FROM cookies")
+                    rows_total = int(cur.fetchone()[0] or 0)
             except (sqlite3.Error, PermissionError, OSError):
                 hosts = []
+            if rows_total:
+                # The row COUNT is the number that makes the incident-response
+                # ordering land: a stolen cookie authenticates without the
+                # password and without MFA, so "sign out everywhere" has to come
+                # BEFORE "change your password", not after.
+                result.add(Finding(
+                    surface="browser-login",
+                    tier="P2",
+                    # "cookie" is itself a proximity keyword, so the plural form is used
+                    # deliberately: "cookie row(s)" would truncate this line.
+                    name=f"{len(hosts)} host(s) with {rows_total} stored browser cookies",
+                    category="session-cookie-volume",
+                    count=rows_total,
+                    detail=f"profile {label}",
+                    pivot=(
+                        "session hijack — a stolen cookie survives a PASSWORD "
+                        "RESET and bypasses MFA until it expires or you revoke "
+                        "sessions. Revoke sessions BEFORE rotating passwords."
+                    ),
+                    remediation=(
+                        "Use each provider's 'sign out of all devices' / "
+                        "'revoke sessions' control first, then rotate the "
+                        "password. Clearing cookies locally does not invalidate "
+                        "a copy an attacker already took."
+                    ),
+                    location=f"{label}",
+                ))
             hv = sorted({
                 h for h in hosts
                 if any(hint in (h or "").lower() for hint in HIGH_VALUE_LOGIN_HINTS)
@@ -1157,6 +1208,1144 @@ def scan_dot_secrets(result: ScanResult) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Surface (f): developer credentials — SSH keys, cloud/registry credential
+# files, shell history. NAMES, MODES and COUNTS only.
+#
+# Why this surface exists: the four v0.1.x surfaces cover what a stealer takes
+# from a *consumer*. They miss the highest-pivot files on a solo developer's
+# Mac. An SSH key plus a GitHub token is push access to every repo the developer
+# owns — which turns a personal breach into a supply-chain breach — and the
+# report said nothing about any of it.
+# ---------------------------------------------------------------------------
+
+_OPENSSH_MAGIC = b"openssh-key-v1\x00"
+
+# We base64-decode at most this many characters of an OPENSSH key body.
+# 112 chars -> 84 bytes. That covers the magic, ciphername, kdfname, kdfoptions
+# and (for a passphrase-less key) the PUBLIC key type — and stops SHORT of the
+# private section in both the encrypted layout (private section starts at ~126
+# bytes) and the plaintext one (~94 bytes). This bound is the privacy invariant
+# for this surface, not an optimisation: private key material is never decoded,
+# so it cannot be held, logged or emitted even by accident.
+_OPENSSH_HEADER_B64_CHARS = 112
+
+_PEM_BEGIN = re.compile(r"-----BEGIN ([A-Z0-9 ]*?)PRIVATE KEY-----")
+
+
+def _ssh_string(buf: bytes, off: int) -> tuple[bytes | None, int]:
+    """Read one SSH wire-format string (uint32 length + bytes). Bounds-checked."""
+    if off + 4 > len(buf):
+        return None, off
+    n = int.from_bytes(buf[off:off + 4], "big")
+    off += 4
+    if n > 4096 or off + n > len(buf):
+        return None, off
+    return buf[off:off + n], off + n
+
+
+def _openssh_header_fields(b64_head: str) -> tuple[str | None, bool | None]:
+    """
+    (key_type, is_encrypted) from the HEADER of an OPENSSH-format private key.
+
+    Only the bytes decoded from `b64_head` are ever examined, and the caller
+    hands us at most _OPENSSH_HEADER_B64_CHARS characters — the public prefix.
+    """
+    b64 = re.sub(r"\s", "", b64_head)[:_OPENSSH_HEADER_B64_CHARS]
+    b64 = b64[: len(b64) - (len(b64) % 4)]
+    if not b64:
+        return None, None
+    try:
+        data = base64.b64decode(b64, validate=False)
+    except (ValueError, TypeError):
+        return None, None
+    if not data.startswith(_OPENSSH_MAGIC):
+        return None, None
+    off = len(_OPENSSH_MAGIC)
+    cipher, off = _ssh_string(data, off)
+    if cipher is None:
+        return None, None
+    encrypted = cipher.decode("ascii", "ignore") not in ("", "none")
+    _kdf, off = _ssh_string(data, off)          # kdfname
+    _kdfopts, off = _ssh_string(data, off)      # kdfoptions (salt + rounds)
+    key_type: str | None = None
+    if off + 4 <= len(data):
+        off += 4                                # number of keys
+        blob, off = _ssh_string(data, off)      # PUBLIC key blob
+        if blob:
+            kt, _ = _ssh_string(blob, 0)
+            if kt:
+                key_type = kt.decode("ascii", "ignore") or None
+    return key_type, encrypted
+
+
+def _ssh_type_from_pub(path: Path) -> str | None:
+    """Key type from the PUBLIC half (`<key>.pub`), which is not a secret."""
+    pub = Path(str(path) + ".pub")
+    try:
+        first = pub.read_text(encoding="utf-8", errors="ignore").split(None, 1)[0]
+    except (OSError, IndexError):
+        return None
+    return first if first.startswith(("ssh-", "ecdsa-", "sk-ssh", "sk-ecdsa")) else None
+
+
+def classify_ssh_key(path: Path) -> tuple[str, bool] | None:
+    """
+    (key_type, is_encrypted) for a private key file, or None if `path` is not
+    one. Reads a bounded header only; never decodes or returns key material.
+    """
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return None
+
+    if "PuTTY-User-Key-File" in head:
+        m = re.search(r"^PuTTY-User-Key-File-\d+:\s*(\S+)", head, re.M)
+        enc = re.search(r"^Encryption:\s*(\S+)", head, re.M)
+        return (
+            (m.group(1) if m else "putty"),
+            bool(enc and enc.group(1).lower() != "none"),
+        )
+
+    m = _PEM_BEGIN.search(head)
+    if not m:
+        return None
+    kind = (m.group(1) or "").strip()
+
+    if kind == "OPENSSH":
+        body = head.split("-----\n", 1)[-1] if "-----\n" in head else head
+        key_type, encrypted = _openssh_header_fields(body)
+        if key_type is None:
+            # For an ENCRYPTED key the public blob sits past our decode bound,
+            # so the type comes from the public half if it is on disk. This is
+            # deliberate: we widen the bound for nobody.
+            key_type = _ssh_type_from_pub(path)
+        if encrypted is None:
+            # Unparseable header: report the format, and do NOT claim it is
+            # plaintext. Unknown encryption is not the P0 case.
+            return ("openssh", True)
+        return (key_type or "openssh", encrypted)
+
+    # Classic PEM (RSA / EC / DSA) and PKCS#8. "ENCRYPTED" appears either in
+    # the BEGIN line (PKCS#8) or as `Proc-Type: 4,ENCRYPTED` (classic + DEK-Info).
+    header_block = head[: head.find("\n\n") + 1] if "\n\n" in head else head[:512]
+    encrypted = ("ENCRYPTED" in kind) or ("ENCRYPTED" in header_block)
+    label = (kind.lower().replace(" ", "-") or "pkcs8") + "-pem"
+    return (label, encrypted)
+
+
+def _key_names_ini(text: str) -> list[str]:
+    """Section headers + key names from an INI/TOML-ish file. Never values."""
+    out: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith(("#", ";")):
+            continue
+        if s.startswith("[") and s.endswith("]"):
+            out.append(s)
+        elif "=" in s:
+            out.append(s.split("=", 1)[0].strip())
+    return out
+
+
+def _key_names_yaml(text: str) -> list[str]:
+    """Key names from an indentation-based YAML file. Never values."""
+    out: list[str] = []
+    for line in text.splitlines():
+        m = re.match(r"^\s*:?([A-Za-z0-9_.\-]+)\s*:(?:\s|$)", line)
+        if m:
+            out.append(m.group(1))
+    return out
+
+
+def _key_names_json(text: str) -> list[str]:
+    """Key names (two levels) from a JSON file. Never values."""
+    try:
+        obj = json.loads(text)
+    except (ValueError, TypeError):
+        return []
+    out: list[str] = []
+
+    def walk(node, depth: int) -> None:
+        if depth > 2 or not isinstance(node, dict):
+            return
+        for k, v in node.items():
+            out.append(str(k))
+            walk(v, depth + 1)
+
+    walk(obj, 0)
+    return out
+
+
+def _key_names_npmrc(text: str) -> list[str]:
+    """Registry scope + setting name (left of '='). The token is never touched."""
+    return [
+        line.split("=", 1)[0].strip()
+        for line in text.splitlines()
+        if "=" in line and not line.strip().startswith(("#", ";"))
+    ]
+
+
+def _key_names_netrc(text: str) -> list[str]:
+    """
+    FIELD names present + the machine COUNT. A .netrc `login` value is a
+    username and a `password` value is a password, so neither is ever read.
+    """
+    toks = text.split()
+    fields = sorted({t for t in toks if t in
+                     ("machine", "default", "login", "account", "password", "port")})
+    n = sum(1 for t in toks if t == "machine")
+    return [f"{n} machine entry(ies)"] + [f"field: {f}" for f in fields]
+
+
+def _key_names_git_credentials(text: str) -> list[str]:
+    """
+    HOST names only. Every line of this file is literally
+    `https://user:token@host` — the credential IS the line, so no line is ever
+    emitted, parsed for userinfo, or held.
+    """
+    hosts: set[str] = set()
+    n = 0
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        n += 1
+        try:
+            host = urlparse(line.strip()).hostname
+        except ValueError:
+            host = None
+        if host:
+            hosts.add(host.lower())
+    return [f"{n} stored entry(ies)"] + sorted(hosts)
+
+
+# (relative path, parser, human label, pivot sentence)
+DEV_CREDENTIAL_FILES: tuple[tuple[str, str, str, str], ...] = (
+    (".aws/credentials", "ini", "AWS CLI credentials",
+     "full use of every AWS resource this key's IAM policy allows — including "
+     "reading your S3 buckets and creating new users"),
+    (".npmrc", "npmrc", "npm registry credentials",
+     "publishing a malicious version of every package you own — a personal "
+     "breach becomes a supply-chain breach"),
+    (".pypirc", "ini", "PyPI upload credentials",
+     "publishing a malicious version of every PyPI package you own — a personal "
+     "breach becomes a supply-chain breach"),
+    (".netrc", "netrc", "netrc machine credentials",
+     "authenticated access to every host listed, by curl/git/ftp, with no "
+     "further prompt"),
+    (".config/gh/hosts.yml", "yaml", "GitHub CLI OAuth credentials",
+     "push access to every repository you can write to, plus Actions secrets "
+     "and release publishing — a personal breach becomes a supply-chain breach"),
+    (".docker/config.json", "json", "Docker registry credentials",
+     "pushing a poisoned image to every registry namespace you can write to"),
+    (".kube/config", "yaml", "Kubernetes cluster credentials",
+     "workload execution inside every cluster listed"),
+    (".config/gcloud", "dir", "gcloud SDK credentials store",
+     "use of every Google Cloud project this account can reach"),
+    (".git-credentials", "git-credentials", "git credentials store, plaintext by design",
+     "push access to every host listed — this file stores the token in "
+     "cleartext by design"),
+    (".cargo/credentials.toml", "ini", "crates.io publish credentials",
+     "publishing a malicious version of every crate you own"),
+    (".gem/credentials", "yaml", "RubyGems publish credentials",
+     "publishing a malicious version of every gem you own"),
+)
+
+_KEY_NAME_PARSERS = {
+    "ini": _key_names_ini,
+    "yaml": _key_names_yaml,
+    "json": _key_names_json,
+    "npmrc": _key_names_npmrc,
+    "netrc": _key_names_netrc,
+    "git-credentials": _key_names_git_credentials,
+}
+
+# Files inside ~/.config/gcloud that hold live credentials.
+_GCLOUD_CREDENTIAL_FILES = (
+    "credentials.db", "access_tokens.db", "application_default_credentials.json",
+    "legacy_credentials",
+)
+
+HISTORY_FILES = (".zsh_history", ".bash_history", ".sh_history")
+
+# A run long enough to be a token, in the token alphabet. Deliberately stricter
+# than redact()'s _VALUE_SHAPE: a history file is full of paths and git SHAs.
+_HISTORY_TOKEN_RUN = re.compile(r"[A-Za-z0-9+/=_\-]{24,}")
+
+
+def _history_line_classes(line: str) -> set[str]:
+    """
+    Which credential PREFIX CLASSES (a fixed label vocabulary) does this line
+    contain? The matched text itself is never returned, stored or emitted.
+    """
+    hits = {
+        label for prefix, label in SECRET_VALUE_PREFIXES.items()
+        if prefix in line
+    }
+    if hits:
+        return hits
+    low = line.lower()
+    if any(h in low for h in SENSITIVE_KEY_HINTS):
+        for m in _HISTORY_TOKEN_RUN.finditer(line):
+            run = m.group(0)
+            if "/" in run or "." in run:
+                continue                       # a path or a version, not a token
+            if shannon_entropy(run) >= 3.6:
+                return {"high-entropy string next to a credential keyword"}
+    return set()
+
+
+def scan_shell_history(result: ScanResult) -> None:
+    """
+    Secret-shaped runs in shell history: COUNT + LINE NUMBERS + prefix CLASS.
+
+    Shell history routinely contains pasted secrets (`export
+    STRIPE_KEY=…`, `curl -H "Authorization: Bearer …"`) and nothing on macOS
+    surfaces it. The line numbers are the whole deliverable: they let you go
+    fix the file without the tool ever reading the token to you.
+    """
+    home = Path.home()
+    for rel in HISTORY_FILES:
+        path = home / rel
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            if path.stat().st_size > MAX_FILE_BYTES * 4:
+                result.note(f"{rel}: too large to scan; skipped.")
+                continue
+            text = path.read_text(errors="ignore")
+        except OSError:
+            result.note(f"{rel}: present but not readable.")
+            continue
+
+        line_nos: list[int] = []
+        classes: set[str] = set()
+        for lineno, line in enumerate(text.splitlines(), 1):
+            cls = _history_line_classes(line)
+            if cls:
+                line_nos.append(lineno)
+                classes |= cls
+            # `line` and `cls` go out of scope here. Nothing is retained.
+        del text
+
+        if not line_nos:
+            continue
+        known = classes - {"high-entropy string next to a credential keyword"}
+        tier = "P0" if known else "P1"
+        shown = ", ".join(str(n) for n in line_nos[:20])
+        if len(line_nos) > 20:
+            shown += f", +{len(line_nos) - 20} more"
+        result.add(Finding(
+            surface="dev-credential",
+            tier=tier,
+            name=f"{rel}: {len(line_nos)} secret-shaped run(s) on line(s) {shown}",
+            category="shell-history",
+            count=len(line_nos),
+            detail="matched text is never read into the report; go look yourself",
+            shape=", ".join(sorted(classes)),
+            pivot=(
+                "a stealer that copies your history file gets every credential "
+                "you have ever pasted into a shell, in cleartext, with the "
+                "command that shows what it unlocks"
+            ),
+            remediation=(
+                "Open the file at those line numbers, rotate anything live, then "
+                "delete the lines. Prefix a command with a SPACE (with "
+                "HIST_IGNORE_SPACE set) to keep it out of history, and read "
+                "secrets from a file or the Keychain instead of the command line."
+            ),
+            location=f"~/{rel}",
+        ))
+
+
+def scan_ssh_keys(result: ScanResult) -> None:
+    ssh_dir = Path.home() / ".ssh"
+    if not ssh_dir.is_dir():
+        result.note("~/.ssh: directory not present.")
+        return
+    try:
+        entries = sorted(p for p in ssh_dir.iterdir() if p.is_file())
+    except (PermissionError, OSError):
+        result.note("~/.ssh: present but not readable.")
+        return
+
+    found = 0
+    for p in entries:
+        if p.suffix in (".pub", ".html", ".md"):
+            continue
+        info = classify_ssh_key(p)
+        if info is None:
+            continue
+        key_type, encrypted = info
+        found += 1
+        try:
+            mode = stat.S_IMODE(p.stat().st_mode)
+        except OSError:
+            mode = None
+        exposed = mode is not None and bool(mode & (stat.S_IRWXG | stat.S_IRWXO))
+
+        if not encrypted:
+            tier = "P0"
+            state = "PLAINTEXT private key - no passphrase"
+        elif exposed:
+            tier = "P0"
+            state = "encrypted private key"
+        else:
+            tier = "P2"
+            state = "encrypted private key"
+        perm = f"chmod {oct(mode)[-3:]}" if mode is not None else "mode unknown"
+        if exposed:
+            perm += " - GROUP/OTHER READABLE"
+
+        result.add(Finding(
+            surface="dev-credential",
+            tier=tier,
+            name=f"{p.name}: {state}",
+            category="ssh-private-key",
+            count=1,
+            detail=f"type {key_type}",
+            shape=perm,
+            pivot=(
+                "push access to every repo you own and login to every host that "
+                "trusts this key - a personal breach becomes a supply-chain "
+                "breach. A passphrase-less key is usable the second it is copied; "
+                "nothing else has to be cracked."
+                if not encrypted else
+                "usable only if the attacker also captures the passphrase "
+                "(keylogger, Accessibility grant, or a fake prompt)"
+            ),
+            remediation=(
+                "Add a passphrase in place, without regenerating the key: "
+                "`ssh-keygen -p -f ~/.ssh/<key>`. Then `chmod 600` it, load it "
+                "into the agent once per session, and remove the public half "
+                "from any host you no longer use."
+            ),
+            location="~/.ssh",
+        ))
+
+    if not found:
+        result.note("~/.ssh: no private keys found.")
+
+
+def scan_dev_credentials(result: ScanResult) -> None:
+    """
+    Presence + file MODE + KEY NAMES ONLY for the credential files a
+    developer-targeted stealer takes first. No value is ever parsed out.
+    """
+    home = Path.home()
+    scan_ssh_keys(result)
+
+    for rel, fmt, label, pivot in DEV_CREDENTIAL_FILES:
+        path = home / rel
+
+        if fmt == "dir":
+            if not path.is_dir():
+                continue
+            present: list[str] = []
+            for name in _GCLOUD_CREDENTIAL_FILES:
+                if (path / name).exists():
+                    present.append(name)
+            if not present:
+                continue
+            names = present
+            mode = None
+            try:
+                mode = stat.S_IMODE(path.stat().st_mode)
+            except OSError:
+                pass
+            size = None
+        else:
+            if not path.is_file():
+                continue
+            try:
+                st = path.stat()
+                mode = stat.S_IMODE(st.st_mode)
+                size = st.st_size
+                text = path.read_text(errors="ignore") if size <= MAX_FILE_BYTES else ""
+            except OSError:
+                result.note(f"~/{rel}: present but not readable.")
+                continue
+            parser = _KEY_NAME_PARSERS.get(fmt)
+            names = parser(text) if parser else []
+            del text                      # values are never held past the parse
+
+        exposed = mode is not None and bool(mode & (stat.S_IRWXG | stat.S_IRWXO))
+        tier = "P0" if exposed else "P1"
+        perm = f"chmod {oct(mode)[-3:]}" if mode is not None else "mode unknown"
+        if exposed:
+            perm += " - GROUP/OTHER READABLE"
+        if size is not None:
+            perm = f"{size} bytes, {perm}"
+
+        # De-duplicate while preserving order; cap so one huge kubeconfig does
+        # not become the report.
+        seen: set[str] = set()
+        uniq = [n for n in names if not (n in seen or seen.add(n))][:12]
+        detail = "names present: " + ", ".join(uniq) if uniq else "no names parsed"
+        if len(names) > len(uniq):
+            detail += f", +{len(names) - len(uniq)} more"
+
+        result.add(Finding(
+            surface="dev-credential",
+            tier=tier,
+            name=f"~/{rel}: {label}" + (" - WORLD/GROUP-READABLE" if exposed else ""),
+            category="dev-credential-file",
+            count=1,
+            detail=detail,
+            shape=perm,
+            pivot=pivot,
+            remediation=(
+                f"chmod 600 ~/{rel}. Rotate the credential if this machine was "
+                "ever exposed, and prefer a short-lived/scoped token (gh auth "
+                "login, aws sso login, npm granular access token) over a "
+                "long-lived one stored on disk."
+            ),
+            location=f"~/{rel}",
+        ))
+
+    scan_shell_history(result)
+
+
+# ---------------------------------------------------------------------------
+# Surface (g): crypto wallets — browser extension stores + desktop bundles.
+#
+# P0 unconditionally: crypto theft is irreversible, uninsured, and has no
+# chargeback. The tool already tiers a seed phrase in Notes at P0 and then
+# never looked where wallets actually live.
+# ---------------------------------------------------------------------------
+
+# Chromium extension IDs of the wallets AMOS-family stealers enumerate.
+WALLET_EXTENSION_IDS = {
+    "nkbihfbeogaeaoehlefnkodbefgpgknn": "MetaMask",
+    "ejbalbakoplchlghecdalmeeeajnimhm": "MetaMask (MV3)",
+    "egjidjbpglichdcondbcbdnbeeppgdph": "Trust Wallet",
+    "hnfanknocfeofbddgcijnmhnfnkdnaad": "Coinbase Wallet",
+    "bfnaelmomeimhlpmgjnjophhpkkoljpa": "Phantom",
+    "fhbohimaelbohpjbbldcngcnapndodjp": "BNB Chain Wallet",
+    "ibnejdfjmmkpcnlpebklmnkoeoihofec": "TronLink",
+    "aeachknmefphepccionboohckonoeemg": "Coin98",
+    "hifafgmccdpekplomjjkcfgodnhcellj": "Crypto.com DeFi Wallet",
+    "afbcbjpbpfadlkmhmclhkeeodmamcflc": "MathWallet",
+    "jbdaocneiiinmjbjlgalhcelgbejmnid": "Nifty Wallet",
+    "opcgpfmipidbgpenhmajoajpbobppdil": "Sui Wallet",
+    "dmkamcknogkgcdfhhbddcghachkejeap": "Keplr",
+    "jnlgamecbpmbajjfhmmmlhejkemejdma": "Braavos",
+    "fnjhmkhhmkbjkkabndcnnogagogbneec": "Ronin Wallet",
+    "aholpfdialjgjfhomihkjbmgjidlcdno": "Exodus Web3",
+    "bhhhlbepdkbapadjdnnojkbgioiodbic": "Solflare",
+    "acmacodkjbdgmoleebolmdjonilkdbch": "Rabby",
+    "nphplpgoakhhjchkkhmiggakijnkhfnd": "Ton Wallet",
+    "hmeobnfnfcmdkdcmlblgagmfpfboieaf": "XDEFI",
+}
+
+# Desktop wallet application-support bundles, relative to ~/Library.
+DESKTOP_WALLET_DIRS = {
+    "Application Support/Exodus": "Exodus",
+    "Application Support/Electrum": "Electrum",
+    "Application Support/Ledger Live": "Ledger Live",
+    "Application Support/@trezor/suite-desktop": "Trezor Suite",
+    "Application Support/atomic": "Atomic Wallet",
+    "Application Support/Coinomi": "Coinomi",
+    "Application Support/Daedalus Mainnet": "Daedalus",
+    "Application Support/Sparrow": "Sparrow",
+    "Application Support/Guarda": "Guarda",
+    "Application Support/Bitcoin": "Bitcoin Core",
+    "Application Support/Ethereum/keystore": "geth keystore",
+    "Application Support/monero-project": "Monero",
+    "Application Support/Wasabi Wallet": "Wasabi",
+}
+
+_WALLET_PIVOT = (
+    "irreversible theft. Crypto has no chargeback, no fraud department and no "
+    "insurance: a drained wallet is gone. A stealer copies the whole extension "
+    "store and brute-forces the vault password offline, on its own hardware"
+)
+_WALLET_REMEDIATION = (
+    "Move anything you are not actively trading to a hardware wallet, and treat "
+    "the seed as already exposed if this Mac was ever compromised: generate a "
+    "NEW wallet on a DIFFERENT clean device and move the funds. Rotating the "
+    "extension password does not help - the attacker has the encrypted vault."
+)
+
+
+def scan_wallets(result: ScanResult) -> None:
+    found_any = False
+
+    for label, pdir in _browser_profiles():
+        ext_root = pdir / "Local Extension Settings"
+        if not ext_root.is_dir():
+            continue
+        try:
+            present = sorted(
+                (WALLET_EXTENSION_IDS[d.name], d.name)
+                for d in ext_root.iterdir()
+                if d.is_dir() and d.name in WALLET_EXTENSION_IDS
+            )
+        except (PermissionError, OSError):
+            result.note(f"Browser {label}: extension settings not readable.")
+            continue
+        for wallet, ext_id in present:
+            found_any = True
+            try:
+                files = sum(1 for _ in (ext_root / ext_id).iterdir())
+            except OSError:
+                files = 0
+            result.add(Finding(
+                surface="crypto-wallet",
+                tier="P0",
+                name=f"{wallet}: browser wallet store present",
+                category="wallet-extension",
+                count=1,
+                detail=f"profile {label}",
+                shape=f"{files} LevelDB file(s), extension {ext_id}",
+                pivot=_WALLET_PIVOT,
+                remediation=_WALLET_REMEDIATION,
+                location=f"{label}/Local Extension Settings",
+            ))
+
+    lib = Path.home() / "Library"
+    for rel, wallet in DESKTOP_WALLET_DIRS.items():
+        d = lib / rel
+        if not d.exists():
+            continue
+        found_any = True
+        result.add(Finding(
+            surface="crypto-wallet",
+            tier="P0",
+            name=f"{wallet}: desktop wallet data present",
+            category="wallet-desktop",
+            count=1,
+            detail=f"~/Library/{rel}",
+            pivot=_WALLET_PIVOT,
+            remediation=_WALLET_REMEDIATION,
+            location=f"~/Library/{rel}",
+        ))
+
+    if not found_any:
+        result.note("Crypto wallets: no browser wallet stores or desktop wallet data found.")
+
+
+# ---------------------------------------------------------------------------
+# Surface (h): the login keychain, Safari and Firefox — so the report is not
+# silently Chrome-shaped.
+# ---------------------------------------------------------------------------
+
+# `security dump-keychain` can raise a GUI unlock prompt. This tool will not
+# make your Mac ask for your keychain password, so the item count is opt-in.
+KEYCHAIN_COUNT_ENV = "EXPOSURESCAN_KEYCHAIN_COUNT"
+
+
+def _safe_run(cmd: list[str], timeout: float = 8.0) -> str | None:
+    """Run a read-only command. Returns stdout, or None on any failure."""
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # `security show-keychain-info` writes its answer to STDERR with rc 0, so
+    # both streams are returned.
+    return (proc.stdout or "") + (proc.stderr or "")
+
+
+def scan_keychain(result: ScanResult) -> None:
+    kc = Path.home() / "Library" / "Keychains" / "login.keychain-db"
+    if not kc.exists():
+        kc = Path.home() / "Library" / "Keychains" / "login.keychain"
+    if not kc.exists():
+        result.note("Keychain: login.keychain-db not found.")
+        return
+    try:
+        size = kc.stat().st_size
+    except OSError:
+        size = 0
+
+    # show-keychain-info reports lock/timeout state and does NOT prompt.
+    info = _safe_run(["security", "show-keychain-info", str(kc)]) or ""
+    lock_state = "unknown"
+    if "no-timeout" in info:
+        lock_state = "unlocked, no auto-lock timeout"
+    elif "timeout" in info:
+        lock_state = "auto-lock timeout set"
+    elif "could not be found" in info:
+        lock_state = "unknown"
+
+    shape = f"{size} bytes"
+    detail = f"lock state: {lock_state}"
+    if os.environ.get(KEYCHAIN_COUNT_ENV) == "1":
+        dump = _safe_run(["security", "dump-keychain", str(kc)], timeout=30.0)
+        if dump:
+            n = dump.count("class:")
+            detail += f"; {n} item(s)"
+    else:
+        detail += (
+            "; item count not taken - counting can raise a keychain unlock "
+            "prompt, so it is opt-in (see the README)"
+        )
+
+    result.add(Finding(
+        surface="keychain",
+        tier="P1",
+        name="login.keychain-db present",
+        category="keychain",
+        count=1,
+        detail=detail,
+        shape=shape,
+        pivot=(
+            "this one file holds Safari's saved logins, Wi-Fi passwords, "
+            "certificates and app secrets. It is encrypted under your login "
+            "password, so a stealer copies the file and cracks it offline - and "
+            "an unlocked session with an Accessibility grant can read items "
+            "without cracking anything"
+        ),
+        remediation=(
+            "Set a keychain auto-lock timeout (Keychain Access > Edit > Change "
+            "Settings), use a strong login password, and never approve an "
+            "'allow access' prompt you did not personally trigger."
+        ),
+        location="~/Library/Keychains",
+    ))
+
+
+def scan_safari(result: ScanResult) -> None:
+    safari = Path.home() / "Library" / "Safari"
+    container = (Path.home() / "Library" / "Containers" / "com.apple.Safari" /
+                 "Data" / "Library" / "Safari")
+    root = safari if safari.is_dir() else (container if container.is_dir() else None)
+    if root is None:
+        result.note("Safari: no profile directory found.")
+        return
+    # Honest limit, stated rather than faked: Safari does not keep saved logins
+    # in a file we can count. They live in the login keychain, and counting them
+    # means `security` calls that can raise a prompt. We report the surface and
+    # refuse to invent a number.
+    result.add(Finding(
+        surface="browser-login",
+        tier="P2",
+        name="Safari profile present - saved logins live in the login keychain",
+        category="safari-logins",
+        count=1,
+        detail=(
+            "count not taken: Safari stores logins in the login keychain, not "
+            "in a readable file, and counting them can raise a prompt"
+        ),
+        pivot=(
+            "same blast radius as the login keychain finding above: Safari's "
+            "saved logins are keychain items"
+        ),
+        remediation=(
+            "Review them yourself in Settings > Passwords (or the Passwords "
+            "app) and delete what you no longer use."
+        ),
+        location=str(root),
+    ))
+
+
+def _firefox_profiles() -> list[tuple[str, Path]]:
+    base = Path.home() / "Library" / "Application Support" / "Firefox" / "Profiles"
+    if not base.is_dir():
+        return []
+    try:
+        return [(p.name, p) for p in sorted(base.iterdir()) if p.is_dir()]
+    except (PermissionError, OSError):
+        return []
+
+
+def scan_firefox(result: ScanResult) -> None:
+    profiles = _firefox_profiles()
+    if not profiles:
+        result.note("Firefox: no profiles found.")
+        return
+    for name, pdir in profiles:
+        logins = pdir / "logins.json"
+        if logins.exists():
+            try:
+                data = json.loads(logins.read_text(errors="ignore"))
+                entries = data.get("logins", []) if isinstance(data, dict) else []
+            except (OSError, ValueError, TypeError, AttributeError):
+                entries = []
+            # We read `hostname` (a NAME) and COUNT rows. encryptedUsername and
+            # encryptedPassword are never touched, and key4.db is never opened.
+            hosts = sorted({
+                (urlparse(str(e.get("hostname", ""))).hostname or "").lower()
+                for e in entries if isinstance(e, dict)
+            } - {""})
+            hv = [h for h in hosts if any(x in h for x in HIGH_VALUE_LOGIN_HINTS)]
+            if entries:
+                result.add(Finding(
+                    surface="browser-login",
+                    tier="P1" if hv else "P2",
+                    name=f"Firefox {name}: {len(entries)} saved login(s)",
+                    category="firefox-logins",
+                    count=len(entries),
+                    detail=(
+                        f"{len(hosts)} distinct host(s); "
+                        f"{len(hv)} high-value host(s)"
+                    ),
+                    pivot=(
+                        "Firefox stores these under key4.db; if no primary "
+                        "password is set, anyone with both files can decrypt "
+                        "every one of them offline"
+                    ),
+                    remediation=(
+                        "Set a Firefox Primary Password (Settings > Privacy & "
+                        "Security), or move these into a password manager."
+                    ),
+                    location=f"Firefox/{name}",
+                ))
+        cookies = pdir / "cookies.sqlite"
+        if cookies.exists():
+            try:
+                with _TempCopyConn(cookies) as conn:
+                    n = int(conn.execute(
+                        "SELECT count(*) FROM moz_cookies").fetchone()[0] or 0)
+            except (sqlite3.Error, PermissionError, OSError):
+                n = 0
+            if n:
+                result.add(Finding(
+                    surface="browser-login",
+                    tier="P2",
+                    name=f"Firefox {name}: {n} stored cookies",
+                    category="session-cookie-volume",
+                    count=n,
+                    detail="",
+                    pivot=(
+                        "session hijack - a stolen cookie survives a PASSWORD "
+                        "RESET and bypasses MFA until you revoke sessions"
+                    ),
+                    remediation=(
+                        "Revoke sessions provider-side first, then rotate "
+                        "passwords."
+                    ),
+                    location=f"Firefox/{name}",
+                ))
+
+
+# ---------------------------------------------------------------------------
+# Surface (i): TCC grant inventory  (--tcc)
+#
+# The kit's central argument is that malware inherits the grants of the trusted
+# binary it runs inside. This is the flag that finally tells you WHICH binaries
+# those are. Read-only; needs no new permission (the system TCC.db needs Full
+# Disk Access to READ, and degrades to a note without it).
+#
+# Deliberately EXCLUDED: FileVault, firewall, update settings, sudoers, password
+# policy, the general CIS sweep. mSCP and Pareto Security own that and own it
+# better; see the README.
+# ---------------------------------------------------------------------------
+
+TCC_USER_DB = "Library/Application Support/com.apple.TCC/TCC.db"
+TCC_SYSTEM_DB = "/Library/Application Support/com.apple.TCC/TCC.db"
+
+# Services that make the holder a grant-INHERITANCE vehicle.
+TCC_HIGH_RISK_SERVICES = {
+    "kTCCServiceSystemPolicyAllFiles": "Full Disk Access",
+    "kTCCServiceAccessibility": "Accessibility (drive any app, read any window)",
+    "kTCCServiceScreenCapture": "Screen Recording",
+    "kTCCServiceListenEvent": "Input Monitoring (reads every keystroke)",
+    "kTCCServicePostEvent": "synthetic keystroke injection",
+    "kTCCServiceDeveloperTool": "Developer Tools (spawned processes skip Gatekeeper)",
+    "kTCCServiceSystemPolicySysAdminFiles": "admin-files access",
+    "kTCCServiceEndpointSecurityClient": "Endpoint Security client",
+}
+
+TCC_OTHER_SERVICES = {
+    "kTCCServicePhotos": "Photos",
+    "kTCCServiceCamera": "Camera",
+    "kTCCServiceMicrophone": "Microphone",
+    "kTCCServiceAddressBook": "Contacts",
+    "kTCCServiceCalendar": "Calendar",
+    "kTCCServiceReminders": "Reminders",
+    "kTCCServiceAppleEvents": "Automation (AppleEvents)",
+    "kTCCServiceSystemPolicyDesktopFolder": "Desktop folder",
+    "kTCCServiceSystemPolicyDocumentsFolder": "Documents folder",
+    "kTCCServiceSystemPolicyDownloadsFolder": "Downloads folder",
+    "kTCCServiceMediaLibrary": "Media library",
+    "kTCCServiceUbiquity": "iCloud Drive",
+}
+
+# Bundle IDs that are terminals, remote-access tools or script runners: a
+# payload executed inside them runs WITH their grants and never sees a prompt.
+GRANT_INHERITANCE_BUNDLE_IDS = {
+    "com.apple.terminal", "com.googlecode.iterm2", "com.mitchellh.ghostty",
+    "dev.warp.warp-stable", "dev.warp.warp-preview", "io.alacritty",
+    "net.kovidgoyal.kitty", "co.zeit.hyper", "com.github.wez.wezterm",
+    "org.tabby", "com.apple.scripteditor2", "com.apple.automator",
+    "com.apple.screensharing", "com.apple.remotedesktop",
+    "com.teamviewer.teamviewer", "com.philandro.anydesk", "com.anydesk.anydesk",
+    "com.realvnc.vncviewer", "com.rustdesk.rustdesk", "com.nulana.remotixmac",
+    "com.apple.shortcuts", "com.runningwithcrayons.alfred",
+    "com.raycast.macos", "com.microsoft.vscode", "com.todesktop.230313mzl4w4u92",
+}
+
+_GRANT_INHERITANCE_NAME = re.compile(
+    r"(terminal|iterm|ghostty|warp|alacritty|kitty|hyper|wezterm|tabby|"
+    r"sshd|ssh-keygen-wrapper|screensharing|remotedesktop|vnc|teamviewer|"
+    r"anydesk|rustdesk|scripteditor|automator|osascript)", re.I,
+)
+
+# A BARE interpreter binary holding a grant is the same problem with no app
+# wrapped around it at all.
+_BARE_INTERPRETER = re.compile(
+    r"/(?:sh|bash|zsh|ksh|dash|tcsh|fish|osascript|expect|"
+    r"python(?:\d+(?:\.\d+)?)?|perl|ruby|node|php|deno|bun|tclsh|lua|"
+    r"Rscript|pwsh|swift|java)$"
+)
+
+
+def is_grant_inheritance_vehicle(client: str) -> bool:
+    """
+    True if `client` is a terminal, shell, SSH wrapper, remote-access tool or
+    bare interpreter — i.e. a thing that RUNS OTHER CODE, so its TCC grants
+    belong to whatever it is told to run.
+    """
+    c = (client or "").strip()
+    if not c:
+        return False
+    if c.lower() in GRANT_INHERITANCE_BUNDLE_IDS:
+        return True
+    if _GRANT_INHERITANCE_NAME.search(c):
+        return True
+    if c.startswith("/") and _BARE_INTERPRETER.search(c):
+        return True
+    return False
+
+
+def _client_label(client: str) -> str:
+    """Human-readable name for a TCC client id/path. Never a value."""
+    c = (client or "").strip()
+    if c.startswith("/"):
+        return Path(c).name or c
+    return c.rsplit(".", 1)[-1] if "." in c else c
+
+
+def read_tcc_grants(db: Path) -> list[tuple[str, str, int]]:
+    """
+    [(service, client, auth)] from a TCC.db, read-only via the shared safe-copy
+    machinery. Handles both the modern `auth_value` schema and the legacy
+    `allowed` one. Raises on access failure so the caller can degrade.
+    """
+    with _TempCopyConn(db) as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(access)")}
+        auth_col = "auth_value" if "auth_value" in cols else "allowed"
+        rows = conn.execute(
+            f"SELECT service, client, {auth_col} FROM access"
+        ).fetchall()
+    out: list[tuple[str, str, int]] = []
+    for service, client, auth in rows:
+        try:
+            auth_i = int(auth)
+        except (TypeError, ValueError):
+            continue
+        out.append((str(service or ""), str(client or ""), auth_i))
+    return out
+
+
+def scan_tcc(result: ScanResult) -> None:
+    sources = [
+        ("user", Path.home() / TCC_USER_DB),
+        ("system", Path(TCC_SYSTEM_DB)),
+    ]
+    grants: list[tuple[str, str, str, int]] = []
+    read_any = False
+    for scope, db in sources:
+        if not db.exists():
+            result.note(f"TCC ({scope}): {db.name} not found.")
+            continue
+        try:
+            for service, client, auth in read_tcc_grants(db):
+                grants.append((scope, service, client, auth))
+            read_any = True
+        except (sqlite3.Error, PermissionError, OSError):
+            result.note(
+                f"TCC ({scope}): no access to TCC.db - grant Full Disk Access "
+                "to this terminal to inventory it. Skipped, not failed."
+            )
+
+    if read_any:
+        # auth_value: 0 denied, 1 unknown, 2 allowed, 3 limited/allowed.
+        # legacy `allowed`: 1 allowed. Both are covered by >= 1 plus the
+        # explicit modern-denied check.
+        granted = [g for g in grants if g[3] >= 2] or [g for g in grants if g[3] == 1]
+        other_counts: dict[str, int] = {}
+        seen_pairs: set[tuple[str, str]] = set()
+
+        for scope, service, client, _auth in sorted(granted):
+            label = TCC_HIGH_RISK_SERVICES.get(service)
+            if label is None:
+                nice = TCC_OTHER_SERVICES.get(service)
+                if nice:
+                    other_counts[nice] = other_counts.get(nice, 0) + 1
+                continue
+            if (service, client) in seen_pairs:
+                continue
+            seen_pairs.add((service, client))
+            vehicle = is_grant_inheritance_vehicle(client)
+            who = _client_label(client)
+            if vehicle:
+                result.add(Finding(
+                    surface="tcc",
+                    tier="P0",
+                    name=f"{who} holds {label}",
+                    category="tcc-grant-inheritance",
+                    count=1,
+                    detail=f"{scope} TCC.db; client {client}",
+                    pivot=(
+                        f"anything you run inside {who} gets {label} too, with "
+                        "no prompt of its own. A pasted payload does not have to "
+                        f"ask for {label} - it inherits yours the moment it runs. "
+                        "This is not an app holding a permission; it is a "
+                        "permission attached to a thing that runs other code."
+                    ),
+                    remediation=(
+                        f"System Settings > Privacy & Security: remove {who} "
+                        f"from {label} unless you actively need it, and re-grant "
+                        "it per-task rather than permanently. Prefer granting a "
+                        "specific app over granting your terminal."
+                    ),
+                    location=f"TCC ({scope})",
+                ))
+            else:
+                result.add(Finding(
+                    surface="tcc",
+                    tier="P2",
+                    name=f"{who} holds {label}",
+                    category="tcc-grant",
+                    count=1,
+                    detail=f"{scope} TCC.db; client {client}",
+                    pivot=(
+                        "a compromise or malicious update of this app inherits "
+                        f"{label} without ever prompting you again"
+                    ),
+                    remediation=(
+                        "Remove the grant if you cannot name the feature that "
+                        "needs it."
+                    ),
+                    location=f"TCC ({scope})",
+                ))
+
+        if other_counts:
+            result.add(Finding(
+                surface="tcc",
+                tier="P3",
+                name=f"{sum(other_counts.values())} other TCC grant(s) held by apps",
+                category="tcc-other",
+                count=sum(other_counts.values()),
+                detail="",
+                shape=", ".join(f"{k}: {v}" for k, v in sorted(other_counts.items())),
+                pivot=(
+                    "ordinary app permissions - data exposure if that specific "
+                    "app is compromised, but no grant inheritance"
+                ),
+                remediation=(
+                    "Review in System Settings > Privacy & Security and remove "
+                    "anything you do not recognise."
+                ),
+                location="TCC (user + system)",
+            ))
+
+    scan_clickfix_posture(result)
+
+
+def scan_clickfix_posture(result: ScanResult) -> None:
+    """
+    Three adjacent one-liners bundled into --tcc because they are ClickFix
+    relevant and nothing else surfaces them to a consumer:
+    Secure Keyboard Entry, the remote-access surface, and Secure Boot level.
+    """
+    # (1) Terminal Secure Keyboard Entry.
+    ske = _safe_run(["defaults", "read", "com.apple.Terminal", "SecureKeyboardEntry"])
+    ske_on = (ske or "").strip() in ("1", "true", "YES")
+    if not ske_on:
+        result.add(Finding(
+            surface="posture",
+            tier="P2",
+            name="Terminal: Secure Keyboard Entry is OFF",
+            category="secure-keyboard-entry",
+            count=1,
+            detail="Terminal > Secure Keyboard Entry",
+            pivot=(
+                "without it, ANY app holding Accessibility or Input Monitoring "
+                "can read what you type into Terminal - including the admin "
+                "password you type at a sudo prompt, which is the exact step a "
+                "ClickFix payload is trying to get you to perform"
+            ),
+            remediation=(
+                "Terminal > Secure Keyboard Entry (checkbox in the Terminal "
+                "menu). iTerm2: Settings > General > Magic > 'Enable secure "
+                "keyboard entry'."
+            ),
+            location="com.apple.Terminal",
+        ))
+
+    # (2) Remote-access surface.
+    disabled = _safe_run(["launchctl", "print-disabled", "system"]) or ""
+    for svc, human in (("com.openssh.sshd", "Remote Login (SSH)"),
+                       ("com.apple.screensharing", "Screen Sharing")):
+        m = re.search(rf'"{re.escape(svc)}"\s*=>\s*(\w+)', disabled)
+        if not m:
+            continue
+        enabled = m.group(1).lower() in ("false", "enabled")
+        if not enabled:
+            continue
+        result.add(Finding(
+            surface="posture",
+            tier="P1",
+            name=f"{human} is ENABLED ({svc})",
+            category="remote-access",
+            count=1,
+            detail="launchctl print-disabled system",
+            pivot=(
+                "an added line in ~/.ssh/authorized_keys is quieter persistence "
+                "than a LaunchAgent, survives a password change, and is invisible "
+                "to WatchPost's persistence diff"
+                if "ssh" in svc else
+                "full interactive control of the desktop, using the session you "
+                "already unlocked"
+            ),
+            remediation=(
+                "System Settings > General > Sharing: turn this off if you are "
+                "not actively using it. If you need SSH, audit "
+                "~/.ssh/authorized_keys now and restrict it with "
+                "AllowUsers / PermitRootLogin no."
+                if "ssh" in svc else
+                "System Settings > General > Sharing: turn Screen Sharing off "
+                "if you are not actively using it, and check who is listed "
+                "under 'Allow access for'."
+            ),
+            location="launchd (system)",
+        ))
+
+    # (3) Secure Boot level / kext policy (Apple silicon).
+    bridge = _safe_run(["system_profiler", "SPiBridgeDataType"], timeout=25.0) or ""
+    sb = re.search(r"Secure Boot:\s*(.+)", bridge)
+    kext = re.search(r"Allow All Kernel Extensions:\s*(\w+)", bridge)
+    if sb and "full security" not in sb.group(1).strip().lower():
+        result.add(Finding(
+            surface="posture",
+            tier="P2",
+            name=f"Secure Boot: {sb.group(1).strip()} (not Full Security)",
+            category="secure-boot",
+            count=1,
+            detail=(
+                "kernel extensions: allowed"
+                if kext and kext.group(1).lower() == "yes" else ""
+            ),
+            pivot=(
+                "reduced security permits unsigned/third-party kernel "
+                "extensions and downgraded boot policy - a real weakening of the "
+                "boot chain that no other tool in this kit would report"
+            ),
+            remediation=(
+                "If you did not deliberately reduce it (for a kext, a VM tool, "
+                "or another OS), restore Full Security via Recovery > Startup "
+                "Security Utility."
+            ),
+            location="Secure Boot policy",
+        ))
+
+
+# ---------------------------------------------------------------------------
 # Surface (e): PII markers in Desktop / Documents / Downloads (COUNTS only)
 # ---------------------------------------------------------------------------
 
@@ -1400,11 +2589,15 @@ def render_markdown(result: ScanResult, target: Path) -> str:
     lines.append("1. **P0 first** — Move every plaintext live key (AWS/Stripe/Anthropic/DB URI), "
                  "private key, and wallet seed out of `.env`/`~/.secrets`/Notes into the macOS "
                  "Keychain or a password manager, then **rotate** them. `chmod 700 ~/.secrets`, "
-                 "`chmod 600` each secret file.")
+                 "`chmod 600` each secret file. Put a passphrase on every SSH key "
+                 "(`ssh-keygen -p -f ~/.ssh/<key>`), and if a wallet was on this machine during "
+                 "an incident, move the funds to a NEW wallet generated on a DIFFERENT clean "
+                 "device — that loss is the only irreversible one.")
     lines.append("2. **P1** — Stop saving passwords in the browser for financial/email/registrar "
                  "origins; migrate to a password manager; enable OS-level encryption.")
-    lines.append("3. **P2** — Sign out of sensitive sites to kill session cookies; encrypt or "
-                 "delete documents containing SIN/SSN/card numbers.")
+    lines.append("3. **P2** — Revoke sessions provider-side (a stolen cookie survives a "
+                 "password reset) BEFORE rotating passwords; encrypt or delete documents "
+                 "containing SIN/SSN/card numbers; drop TCC grants you cannot justify.")
     lines.append("4. **P3** — Clear stale PII exports from Downloads; review trusted-host logins.")
     lines.append("")
     lines.append("> This audit shrinks the blast radius. It does **not** stop you from pasting a "
@@ -1463,13 +2656,25 @@ def write_private(path: Path, data: str) -> Path:
     return path
 
 
-def run_scan(target: Path, *, do_notes: bool, do_browser: bool) -> ScanResult:
+def run_scan(
+    target: Path,
+    *,
+    do_notes: bool,
+    do_browser: bool,
+    do_dev_creds: bool = True,
+    do_tcc: bool = False,
+) -> ScanResult:
     result = ScanResult()
     if do_browser:
         try:
             scan_browser_logins(result)
         except Exception as e:  # never let one surface crash the audit
             result.note(f"Browser surface errored: {e.__class__.__name__}.")
+        for fn, label in ((scan_safari, "Safari"), (scan_firefox, "Firefox")):
+            try:
+                fn(result)
+            except Exception as e:
+                result.note(f"{label} surface errored: {e.__class__.__name__}.")
     if do_notes:
         try:
             scan_apple_notes(result)
@@ -1487,6 +2692,21 @@ def run_scan(target: Path, *, do_notes: bool, do_browser: bool) -> ScanResult:
         scan_pii_markers(result)
     except Exception as e:
         result.note(f"PII surface errored: {e.__class__.__name__}.")
+    if do_dev_creds:
+        for fn, label in (
+            (scan_dev_credentials, "Dev-credential"),
+            (scan_wallets, "Crypto-wallet"),
+            (scan_keychain, "Keychain"),
+        ):
+            try:
+                fn(result)
+            except Exception as e:
+                result.note(f"{label} surface errored: {e.__class__.__name__}.")
+    if do_tcc:
+        try:
+            scan_tcc(result)
+        except Exception as e:
+            result.note(f"TCC surface errored: {e.__class__.__name__}.")
     return result
 
 
@@ -1510,6 +2730,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--no-notes", action="store_true", help="Skip the Apple Notes surface.")
     parser.add_argument("--no-browser", action="store_true", help="Skip the browser-login surface.")
+    parser.add_argument(
+        "--no-dev-creds", action="store_true",
+        help="Skip the developer-credential surface (SSH keys, ~/.aws, ~/.npmrc, "
+             "shell history, wallets, keychain).",
+    )
+    parser.add_argument(
+        "--tcc", action="store_true",
+        help="Add the TCC grant inventory: which binaries hold Full Disk Access / "
+             "Accessibility / Screen Recording, plus Secure Keyboard Entry, the "
+             "remote-access surface and Secure Boot level. Read-only.",
+    )
     args = parser.parse_args(argv)
 
     _install_signal_handlers()
@@ -1523,6 +2754,8 @@ def main(argv: list[str] | None = None) -> int:
         target,
         do_notes=not args.no_notes,
         do_browser=not args.no_browser,
+        do_dev_creds=not args.no_dev_creds,
+        do_tcc=args.tcc,
     )
 
     markdown = render_markdown(result, target)

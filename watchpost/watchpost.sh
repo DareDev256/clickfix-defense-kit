@@ -59,6 +59,11 @@ set -u  # treat unset variables as errors (caught one real bug during dev)
 # Where the baseline snapshot lives. Override with WATCHPOST_STATE_DIR.
 STATE_DIR="${WATCHPOST_STATE_DIR:-$HOME/.local/state/watchpost}"
 BASELINE_FILE="$STATE_DIR/baseline.json"
+# ARMED_FILE proves this machine was previously baselined. Without it, a missing
+# baseline is indistinguishable from a first run — and v0.1.x treated it as one,
+# so `rm baseline.json` made the next run silently absorb whatever persistence
+# had just been planted. It also holds the HMAC key for the baseline.
+ARMED_FILE="$STATE_DIR/.armed"
 
 # Directories we treat as persistence surfaces. Each line: a label and a path.
 # We use a parallel-array approach (bash 3.2 ships with macOS — no associative
@@ -262,10 +267,34 @@ line_to_json() {
 }
 
 # Render a full state blob (the multi-line text) into a JSON array file.
+# Integrity tagging.
+#
+# HONEST LIMITS, stated up front: the HMAC key lives in ARMED_FILE at mode 0600
+# under the same user this tool runs as. An attacker already running as that
+# user can read the key and forge a tag. This is NOT tamper-proofing against a
+# determined local attacker; it is tamper-EVIDENCE against everything cheaper
+# than that — a stealer that blindly rewrites or deletes the baseline, a
+# half-finished cleanup, corruption. The tamper-proof variant is the root-owned
+# daemon writing to /var/db/watchpost at 0600, which a user-level compromise
+# cannot touch. Documented, not oversold.
+baseline_key() {
+  if [ ! -f "$ARMED_FILE" ]; then
+    ( umask 077; head -c 32 /dev/urandom | shasum -a 256 | cut -d' ' -f1 > "$ARMED_FILE" )
+    chmod 600 "$ARMED_FILE" 2>/dev/null || true
+  fi
+  cat "$ARMED_FILE"
+}
+
+baseline_tag() {
+  # baseline_tag <file> -> HMAC-SHA256 of its contents
+  openssl dgst -sha256 -hmac "$(baseline_key)" "$1" 2>/dev/null | awk '{print $NF}'
+}
+
 write_baseline() {
   local state="$1"
   local out="$2"
   mkdir -p "$(dirname "$out")"
+  chmod 700 "$(dirname "$out")" 2>/dev/null || true
 
   {
     printf '{\n'
@@ -285,6 +314,12 @@ write_baseline() {
     printf '\n  ]\n'
     printf '}\n'
   } > "$out"
+
+  # 0600, not the default 0644. This file enumerates every persistence entry on
+  # the machine; it should not be world-readable.
+  chmod 600 "$out" 2>/dev/null || true
+  baseline_tag "$out" > "$out.tag" 2>/dev/null || true
+  chmod 600 "$out.tag" 2>/dev/null || true
 }
 
 # Build a set of stable "identity" keys for the diff. Two runs are compared by
@@ -351,6 +386,37 @@ main() {
 
   local current_state
   current_state="$(collect_state)"
+
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+
+  # A MISSING baseline on a machine that was previously armed is an ALERTABLE
+  # EVENT, not a first run. Deleting the baseline is the cheapest way to blind
+  # this tool, and treating it as a first run is exactly the behaviour an
+  # attacker wants: the next run re-baselines and their persistence becomes
+  # "normal". Refuse, loudly, unless the operator explicitly re-inits.
+  if [ ! -f "$BASELINE_FILE" ] && [ -f "$ARMED_FILE" ] && [ "$INIT_ONLY" -eq 0 ]; then
+    log "BASELINE MISSING on a machine that was previously armed: $BASELINE_FILE"
+    log "This is not a first run. Something deleted the baseline."
+    log "If this was you, re-arm deliberately:  $0 --init"
+    notify "WatchPost: BASELINE MISSING" \
+      "The persistence baseline was deleted. Refusing to silently re-baseline. Re-arm with --init."
+    return 2
+  fi
+
+  # Tamper check on an existing baseline.
+  if [ -f "$BASELINE_FILE" ] && [ -f "$BASELINE_FILE.tag" ] && [ "$INIT_ONLY" -eq 0 ]; then
+    local want have
+    want="$(cat "$BASELINE_FILE.tag" 2>/dev/null || true)"
+    have="$(baseline_tag "$BASELINE_FILE")"
+    if [ -n "$want" ] && [ -n "$have" ] && [ "$want" != "$have" ]; then
+      log "BASELINE TAMPERED: integrity tag does not match $BASELINE_FILE"
+      log "Someone edited the baseline directly — most likely to pre-seed an entry"
+      log "so that a later malicious plant would diff as already-known."
+      notify "WatchPost: BASELINE TAMPERED" \
+        "The stored baseline was modified outside WatchPost. Treat persistence as unverified."
+      return 2
+    fi
+  fi
 
   # First-ever run, or explicit --init: write baseline and exit quietly.
   if [ ! -f "$BASELINE_FILE" ] || [ "$INIT_ONLY" -eq 1 ]; then

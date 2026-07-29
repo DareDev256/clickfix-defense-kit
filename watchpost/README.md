@@ -106,6 +106,39 @@ want: `rm -rf ~/.local/state/watchpost`.)
 
 Override the baseline location with `WATCHPOST_STATE_DIR`.
 
+### `--no-update` is the incident flag
+
+**During an incident, always run `--no-update`.** A normal run promotes the
+current state to the baseline after alerting, so you only get told once per
+change. That is the right default for a monitor and the wrong one for an
+investigation: the next run erases the diff that proved something appeared.
+Capture first (`../preserve.sh`), investigate with `--no-update`, and re-arm only
+when you are done.
+
+### Baseline integrity
+
+The baseline lives in your home directory, which means it is writable by exactly
+the malware this tool exists to catch. Three things now hold:
+
+- It is written **0600** (it enumerates every persistence entry on the machine)
+  inside a **0700** state directory, and carries an HMAC tag.
+- **Editing it directly is detected.** Pre-seeding the baseline with an entry the
+  attacker intends to create later would make the real plant diff as
+  already-known. A tag mismatch aborts the run and alerts.
+- **Deleting it is an alert, not a first run.** An `.armed` marker records that
+  this machine was baselined before. Without it, `rm baseline.json` made the next
+  run print "No diffing on first run" and silently absorb whatever had just been
+  planted. WatchPost now refuses, and tells you to re-arm deliberately with
+  `--init`.
+
+> **Honest limit.** The HMAC key sits in the state directory at 0600, under the
+> same user this tool runs as. Anyone already running as you can read it and
+> forge a tag. This is tamper-**evidence**, not tamper-proofing: it catches a
+> stealer that blindly rewrites or deletes the file; it does not stop a targeted
+> attacker who knows WatchPost is installed. The version that would is a
+> root-owned daemon writing to `/var/db/watchpost`, which a user-level compromise
+> cannot touch. Not built yet, and not claimed.
+
 After an alert, the baseline is promoted to the current state, so you are
 notified **once per change** (not every hour for the same item) — the same
 "alert on state change, not on every run" discipline a good cron job follows.
