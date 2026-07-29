@@ -23,6 +23,7 @@
 #   ./install.sh watchpost        Install WatchPost
 #   ./install.sh exposurescan     Make ExposureScan runnable + run a scan
 #   ./install.sh canary           Make Canary runnable (then run it to plant)
+#   ./install.sh downloadtriage   Make DownloadTriage runnable
 #   ./install.sh guestmode        Make GuestMode runnable (dry-run by default)
 #   ./install.sh all              Install the persistent tools (ShellGuard,
 #                                 ClipSentinel, WatchPost) + make scripts runnable
@@ -113,6 +114,13 @@ install_exposurescan() {
   ok "ExposureScan ready: ./exposurescan/exposurescan.py --help"
 }
 
+install_downloadtriage() {
+  make_runnable downloadtriage downloadtriage.zsh
+  info "DownloadTriage is read-only — it never opens, mounts or installs anything."
+  info "Run it over your Downloads folder:  ./downloadtriage/downloadtriage.zsh"
+  ok "DownloadTriage ready."
+}
+
 install_canary() {
   make_runnable canary canary-gen.sh
   info "Canary plants DECOY honeytokens on YOUR machine. Nothing is planted yet."
@@ -136,6 +144,7 @@ install_all() {
   install_watchpost
   make_runnable exposurescan exposurescan.py
   make_runnable canary canary-gen.sh
+  make_runnable downloadtriage downloadtriage.zsh
   make_runnable guestmode setup-guestmode.sh
   ok "Persistent tools installed; ExposureScan/Canary/GuestMode made runnable."
   info "Run ./exposurescan/exposurescan.py to see your current blast radius."
@@ -157,6 +166,7 @@ install_menu() {
   say "  ${BOLD}3${RST}) ClipSentinel  ${DIM}clipboard copy-time early warning${RST}"
   say "  ${BOLD}4${RST}) GuestMode     ${DIM}standard non-admin account (containment)${RST}"
   say "  ${BOLD}5${RST}) Canary        ${DIM}honeytoken tripwire generator${RST}"
+  say "  ${BOLD}7${RST}) DownloadTriage ${DIM}inspect ~/Downloads before you double-click${RST}"
   say "  ${BOLD}6${RST}) WatchPost     ${DIM}persistence diff for unattended/headless Macs${RST}"
   say "  ${BOLD}a${RST}) All persistent tools + make the rest runnable"
   say "  ${BOLD}u${RST}) Uninstall menu"
@@ -170,6 +180,7 @@ install_menu() {
     3) require_macos; install_clipsentinel ;;
     4) require_macos; install_guestmode ;;
     5) install_canary ;;
+    7) install_downloadtriage ;;
     6) require_macos; install_watchpost ;;
     a|A) install_all ;;
     u|U) uninstall_menu ;;
@@ -294,6 +305,7 @@ main() {
     watchpost)      require_macos; install_watchpost ;;
     exposurescan)   install_exposurescan ;;
     canary)         install_canary ;;
+    downloadtriage) install_downloadtriage ;;
     guestmode)      require_macos; install_guestmode ;;
     all)            install_all ;;
     uninstall)

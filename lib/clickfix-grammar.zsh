@@ -485,6 +485,10 @@ clickfix_check() {
   # ---- walk statements, classifying each pipeline stage ----------------
   local -a stmt
   local stage cw
+  # Declared ONCE. zsh echoes "name=value" when `local name` re-runs on an
+  # already-set name inside a loop, so these must not be re-declared below.
+  local tier m d p sbody
+  local -i found=0 netp=0 execp=0
   local -i saw_dl saw_dec si
   local -a stmt_words
 
@@ -509,11 +513,10 @@ clickfix_check() {
         # interpreter later. Covers curl|sh, curl|tee|sh, curl|gunzip|bash,
         # base64 -d|sh, and every interposed-stage variant in one rule.
         if _cfg_is_interpreter "$cw" && (( saw_dl || saw_dec )); then
-          local tier=block
+          tier=block
           # `curl api | python3 -m json.tool` is a data formatter, not a
           # code loader. Downgrade rather than train the user to ignore us.
           if [[ $stage == *-m[[:space:]]* ]]; then
-            local m
             for m in $CLICKFIX_SAFE_MODULES; do
               [[ $stage == *"-m "*"$m"* ]] && tier=warn
             done
@@ -529,7 +532,7 @@ clickfix_check() {
         # This is the `bash -c "$(curl ...)"` shape, which has no pipe at all.
         if _cfg_is_interpreter "$cw" && [[ $stage == *(-c|-e|--eval|--exec)[[:space:]]* ]]; then
           if [[ $stage == *'$('* || $stage == *'`'* ]]; then
-            local d found=0
+            found=0
             for d in $CLICKFIX_DOWNLOADERS; do
               [[ $stage == *"$d"* ]] && found=1
             done
@@ -539,7 +542,7 @@ clickfix_check() {
           # primitive. v0.1.0 fired on either one alone, so
           # `python3 -c "import os; os.system(1)"` was flagged with no network
           # involved at all. Requiring both kills that false positive.
-          local netp=0 execp=0 p
+          netp=0; execp=0
           for p in urllib urlopen 'requests.get' http socket 'open-uri' 'Net::HTTP' 'child_process' fetch; do
             [[ $stage == *"$p"* ]] && netp=1
           done
@@ -554,7 +557,6 @@ clickfix_check() {
         # link opens Script Editor pre-filled with exactly this shape.
         if [[ $cw == osascript ]]; then
           if [[ $stage == *'do shell script'* ]]; then
-            local d
             for d in $CLICKFIX_DOWNLOADERS; do
               if [[ $stage == *"$d"* ]]; then
                 _cfg_raise block 0 "AppleScript that shells out to ${d} — infostealers use osascript to run payloads and to pop a FAKE password prompt."
@@ -579,7 +581,6 @@ clickfix_check() {
         # Two forms: a bare leading `$(curl x)`, and eval/source/. of one.
         # v0.1.0 only matched the eval form, and only with a literal prefix.
         if [[ $cw == (eval|source|.) ]] || { (( si == 1 )) && [[ ${stage##[[:space:]]#} == ('$('|'`')* ]] }; then
-          local d
           for d in $CLICKFIX_DOWNLOADERS; do
             if [[ $stage == *"$d"* ]]; then
               _cfg_raise block 1 "Runs the output of a remote download as a command (\$( ... ) substitution)."
