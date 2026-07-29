@@ -5,6 +5,52 @@ All notable changes to the ClickFix Defense Kit are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-07-29
+
+### Added — DownloadTriage (7th tool)
+
+ShellGuard guards the shell prompt. That is one execution path, and macOS has
+many — a double-clicked `.command`, a `.pkg` preinstall running as **root**, an
+`.app` inside a DMG, a `.scpt` in Script Editor. None touch a zsh prompt, so
+none could be caught at `accept-line`. This closes the **deliver** stage.
+
+- **`.pkg` install scripts are expanded and run through the shared grammar.**
+  A package's `preinstall`/`postinstall` runs as root, and the user is
+  *conditioned* to type an admin password into Installer.app — so GuestMode's
+  "a phished password can't escalate" framing does not cover it. The escalation
+  is the installer's documented behaviour. If a script would be blocked at your
+  terminal, it is flagged in the installer too, and shown to you.
+  `pkgutil --expand-full` unpacks; it never executes. A test asserts exactly
+  that, using a fixture whose `postinstall` would create a marker file.
+- Reports quarantine attribute (ABSENT on an executable means Gatekeeper will
+  not inspect it at all), `kMDItemWhereFroms` origin URL checked against the
+  grammar's malware-staging host list, and Gatekeeper verdict + signer.
+- `.command`, `.terminal` and `.sh` contents are read through the grammar.
+- DMGs are **not** mounted without `--mount`, because mounting is itself a
+  delivery step in current campaigns.
+- `--json` for scripting; exit `2` when something wants attention.
+
+### Fixed — false positives found by running it on a real Downloads folder
+
+- **An early build reported the official Signal installer as "REJECTED —
+  unsigned."** `spctl -a` with no type argument assumes an executable, so it
+  returns "no usable signature" for legitimate `.dmg` and `.zip` files. A tool
+  that tells you Signal is unsigned is worse than no tool. Gatekeeper verdicts
+  are now rendered only for `.app`, `.pkg` (with `-t install`) and Mach-O
+  binaries. For a `.dmg` the tool says plainly that the signature lives on the
+  app inside and was not checked.
+- A malware-staging host on a non-executable (a `.txt` from a Discord CDN link)
+  now warns rather than alarms.
+- On a real 237-item Downloads folder this cut flagged items from 15 to 3.
+
+### Fixed — shared grammar leaked variables into stdout
+
+`local` re-declared inside a loop makes zsh echo `name=value`. `clickfix_check`
+did this in three places, so `d=socat` and similar leaked into the stdout of
+anything sourcing the grammar. Invisible in ShellGuard (which writes to
+`/dev/tty`) and in the corpus runner (which reads only the verdict), but it
+corrupted DownloadTriage's report. All loop-scoped locals are now declared once.
+
 ## [0.2.0] — 2026-07-29
 
 The kit was born from a breach and, until this release, had nothing for the hour

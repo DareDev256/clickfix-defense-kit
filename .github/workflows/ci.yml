@@ -79,6 +79,17 @@ jobs:
         # run, which silently absorbed whatever had just been planted.
         run: bash tests/test-watchpost-baseline.sh
 
+  downloadtriage:
+    name: DownloadTriage catches root-privileged pkg scripts (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build fixture packages and assert they are triaged correctly
+        # Builds its own .pkg fixtures with pkgbuild. Asserts a hostile
+        # postinstall is flagged, a benign one is not, and — the load-bearing
+        # check — that expanding a package never EXECUTES its scripts.
+        run: bash tests/test-downloadtriage.sh
+
   exposurescan-tests:
     name: ExposureScan redaction invariants
     runs-on: ubuntu-latest

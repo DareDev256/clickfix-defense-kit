@@ -93,13 +93,14 @@ autopilot can be interrupted, contained, or at least *noticed*.
 
 ## The tools
 
-Six small tools, each independent, each installable on its own. They stack into
-defense-in-depth across the kill chain: **copy → paste → execute → escalate →
-persist → exfiltrate**, plus a self-audit of what's already exposed.
+Seven small tools, each independent, each installable on its own. They stack into
+defense-in-depth across the kill chain: **deliver → copy → paste → execute →
+escalate → persist → exfiltrate**, plus a self-audit of what's already exposed.
 
 | Tool | Stage it covers | What it actually stops / does | Honest positioning vs. prior art |
 |------|-----------------|-------------------------------|----------------------------------|
 | **[ShellGuard](./shellguard)** | **Execute** | A zsh guard that tokenizes the command you are about to run, and stops download/decode-and-execute shapes **at the moment you press Enter** — two tiers: a typed confirmation phrase for unambiguous attacks, a single Enter for heuristics. | **The zero-permission control point.** Objective-See's **BlockBlock** added ClickFix protection at Cmd+V in Feb 2026 and inspects real paste content — if you will install a system extension, run it. ShellGuard's remaining honest claim is narrower and still real: it needs **no root, no kext, no system extension and no TCC grant**, it is the only layer that fires on a **typed** (not pasted) command, and it gates at the last authoritative moment: execution. |
+| **[DownloadTriage](./downloadtriage)** | **Deliver** | Read-only inspection of `~/Downloads` before you double-click: quarantine flag, origin URL, Gatekeeper verdict — and for a `.pkg`, it expands the package and runs its **root-privileged** install scripts through the same grammar that guards your shell prompt. | Closes the paths ShellGuard structurally cannot see: a double-clicked `.command`, a `.pkg` preinstall running as root, a `.app` in a DMG. Objective-See's **WhatsYourSign** is the better everyday "who signed this?" tool and is linked. The additive sliver is connecting `.pkg` install scripts to the ClickFix grammar. |
 | **[ExposureScan](./exposurescan)** | **Self-audit** | A read-only, **names-and-counts-only** scan of four surfaces (browser logins, Apple Notes, `.env` files, `~/.secrets`, plus PII markers) that prints a **blast-radius map ranked by pivot value** — never a single secret value. | **Inverts the trufflehog/gitleaks posture.** Those tools *find and print the value*. ExposureScan answers *"what would a stealer walk away with?"* with the values **architecturally absent from the code path**. That inversion is the product. |
 | **[ClipSentinel](./clipsentinel)** | **Copy** | A dependency-free clipboard watchdog. Fires a macOS notification the instant a dangerous command lands on your clipboard — the earliest interception point, before any terminal is involved. | **Use BlockBlock instead if you'll install a system extension** — since Feb 2026 it inspects actual paste content at Cmd+V and does this job better. ClipSentinel is the **zero-permission fallback**: nothing to approve, nothing to trust with root, which is the difference between a family member having *something* and having nothing. It cannot block a paste (macOS exposes no API to); the authoritative block is ShellGuard. |
 | **[Canary](./canary)** | **Detect breach** | A honeytoken generator. Plants traceable decoy credentials (fake AWS keys, `.env`, `passwords.txt`) where stealers grab them, with a walkthrough to wire them to **canarytokens.org** (network callback) and/or `eslogger` (local read-watch). | The network-callback half is **Thinkst Canarytokens' / Objective-See's** territory and they win it — this tool is the *turnkey placement + literacy layer* around them. The only additive sliver is the `eslogger` local-read tripwire for a "read-and-walk-away" attacker. |
@@ -170,6 +171,7 @@ Each tool also installs standalone — see its folder's `README.md`.
 
 1. **ShellGuard** — the load-bearing block. Install first.
 2. **ExposureScan** — run it once to see your current blast radius and fix the P0s.
+2b. **DownloadTriage** — run it once over `~/Downloads` to see what is already sitting there.
 3. **ClipSentinel** — copy-time early warning.
 4. **GuestMode** — make a non-admin account for anyone who isn't you.
 5. **Canary** — plant tripwires so you'd *know* if something got through.
